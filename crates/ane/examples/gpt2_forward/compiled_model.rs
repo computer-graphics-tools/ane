@@ -7,10 +7,6 @@ use crate::executables::{
 use crate::spinner::Spinner;
 use crate::weights::{self, ModelWeights};
 
-/// Immutable compiled model: owns config, weights, and ANE executables.
-///
-/// Created once from HuggingFace safetensors. Use [`Session`](super::session::Session)
-/// to run inference with pre-allocated scratch buffers.
 pub struct CompiledModel {
     pub config: Gpt2Config,
     pub weights: ModelWeights,
@@ -19,7 +15,6 @@ pub struct CompiledModel {
 }
 
 impl CompiledModel {
-    /// Load weights and compile all ANE executables for prefill and decode.
     pub fn from_safetensors(
         config: Gpt2Config,
         safetensors: &SafeTensors,
@@ -50,12 +45,18 @@ impl CompiledModel {
             })
             .collect::<Result<_, ane::Error>>()?;
 
+        spinner.update("Compiling LM head");
+        let lm_head = executables::build_lm_head(
+            &model_weights.ln_f_weight, &model_weights.ln_f_bias,
+            &model_weights.wte, &config,
+        )?;
+
         spinner.finish("Compiled ANE model");
 
         Ok(Self {
             config,
             weights: model_weights,
-            executables: CompiledExecutables { prefill, decode },
+            executables: CompiledExecutables { prefill, decode, lm_head },
             max_sequence_length,
         })
     }

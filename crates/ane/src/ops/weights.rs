@@ -53,7 +53,6 @@ pub(crate) fn build_mil_weight_blob(blobs: &[&WeightBlob]) -> Box<[u8]> {
     let total_size = mil_blob_total_size(blobs);
     let mut out = vec![0u8; total_size];
 
-    // global header
     out[0] = 0x01;
     out[4] = 0x02;
 
@@ -62,7 +61,6 @@ pub(crate) fn build_mil_weight_blob(blobs: &[&WeightBlob]) -> Box<[u8]> {
         let fp16_size = blob.fp16_byte_count();
         let data_offset = cursor + 64;
 
-        // magic: 0xDEADBEEF little-endian
         out[cursor]     = 0xEF;
         out[cursor + 1] = 0xBE;
         out[cursor + 2] = 0xAD;

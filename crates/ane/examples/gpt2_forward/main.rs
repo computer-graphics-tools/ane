@@ -2,7 +2,6 @@ mod compiled_model;
 mod config;
 mod executables;
 mod kv_cache;
-mod lm_head;
 mod sampling;
 mod session;
 mod spinner;

@@ -9,9 +9,9 @@ build = "build.rs"
 [lib]
 crate-type = ["lib"]
 
-[[bin]]
+[[example]]
 name = "gpt2_forward"
-path = "src/bin/gpt2_forward/main.rs"
+path = "examples/gpt2_forward/main.rs"
 
 [dependencies]
 thiserror.workspace = true

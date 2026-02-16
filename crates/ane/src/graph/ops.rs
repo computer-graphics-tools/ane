@@ -12,8 +12,6 @@ use super::tensor::Tensor;
 use super::{Graph, GraphOp};
 
 impl Graph {
-    // ─── Memory ops ───────────────────────────────────────────────────────────
-
     /// Declare a placeholder tensor fed via IOSurface at runtime.
     pub fn placeholder(&mut self, shape: Shape) -> Tensor {
         let tensor = self.alloc(shape);
@@ -46,8 +44,6 @@ impl Graph {
         let (bytes, _) = self.constants.get(&tensor.id).expect("tensor is not a constant");
         WeightBlob::from_f16_bytes(bytes.clone())
     }
-
-    // ─── Convolution ─────────────────────────────────────────────────────────
 
     pub fn convolution_2d_1x1(
         &mut self,
@@ -144,7 +140,6 @@ impl Graph {
         output
     }
 
-    // ─── Activations ─────────────────────────────────────────────────────────
 
     fn activation(&mut self, input: Tensor, mode: ActivationMode) -> Tensor {
         let output = self.alloc(input.shape);
@@ -196,7 +191,6 @@ impl Graph {
         self.activation(input, ActivationMode::SoftSign)
     }
 
-    // ─── Elementwise ─────────────────────────────────────────────────────────
 
     fn elementwise_binary(
         &mut self,
@@ -296,7 +290,6 @@ impl Graph {
         self.elementwise_unary(input, ElementwiseOpType::Inverse)
     }
 
-    // ─── Softmax / concat ────────────────────────────────────────────────────
 
     /// Softmax along the specified axis.
     pub fn soft_max(&mut self, input: Tensor, axis: i64) -> Tensor {
@@ -342,7 +335,6 @@ impl Graph {
         output
     }
 
-    // ─── Matmul ──────────────────────────────────────────────────────────────
 
     /// Matrix multiplication: `out = x @ y` (with optional transposes on last two dims).
     pub fn matrix_multiplication(
@@ -374,7 +366,6 @@ impl Graph {
         output
     }
 
-    // ─── Transpose ───────────────────────────────────────────────────────────
 
     /// Permute the dimensions of `x` according to `perm` (4-element NCHW permutation).
     pub fn transpose(&mut self, input: Tensor, perm: [usize; 4]) -> Tensor {
@@ -397,7 +388,6 @@ impl Graph {
         output
     }
 
-    // ─── Slice ───────────────────────────────────────────────────────────────
 
     /// Extract a sub-tensor starting at `begin` with dimensions `size` (both in NCHW order).
     pub fn slice(&mut self, input: Tensor, begin: [usize; 4], size: [usize; 4]) -> Tensor {
@@ -420,7 +410,6 @@ impl Graph {
         output
     }
 
-    // ─── Shape ops ───────────────────────────────────────────────────────────
 
     pub fn reshape(&mut self, input: Tensor, target: Shape) -> Tensor {
         let output = self.alloc(target);
@@ -451,7 +440,6 @@ impl Graph {
         output
     }
 
-    // ─── Pooling ─────────────────────────────────────────────────────────────
 
     fn pool(
         &mut self,
@@ -531,7 +519,6 @@ impl Graph {
         self.pool(input, PoolType::Average, kh, kw, 1, 1, PadMode::Valid, true)
     }
 
-    // ─── Padding ─────────────────────────────────────────────────────────────
 
     pub fn pad(
         &mut self,
@@ -566,7 +553,6 @@ impl Graph {
         output
     }
 
-    // ─── Reduction ───────────────────────────────────────────────────────────
 
     fn reduce(&mut self, input: Tensor, mode: ReductionMode, axis: i64) -> Tensor {
         let mut out_shape = input.shape;
@@ -607,7 +593,6 @@ impl Graph {
         self.reduce(input, ReductionMode::Max, axis)
     }
 
-    // ─── Instance norm ───────────────────────────────────────────────────────
 
     pub fn instance_norm(
         &mut self,

@@ -3,22 +3,20 @@ use ane::{Executable, Graph, NSQualityOfService, Shape};
 use crate::config::Gpt2Config;
 use crate::weights::LayerWeights;
 
-/// Compiled ANE executables for a single transformer layer during prefill.
 pub struct PrefillLayer {
     pub attention: Executable,
     pub feed_forward: Executable,
 }
 
-/// Compiled ANE executables for a single transformer layer during decode.
 pub struct DecodeLayer {
     pub attention: Executable,
     pub feed_forward: Executable,
 }
 
-/// All compiled ANE executables for prefill and decode phases.
 pub struct CompiledExecutables {
     pub prefill: Box<[PrefillLayer]>,
     pub decode: Box<[DecodeLayer]>,
+    pub lm_head: Executable,
 }
 
 pub const DECODE_SPATIAL_WIDTH: usize = 64;
@@ -27,10 +25,6 @@ fn scalar_shape() -> Shape {
     Shape { batch: 1, channels: 1, height: 1, width: 1 }
 }
 
-/// Build LayerNorm as ANE graph operations.
-///
-/// Uses `add(-mean)` instead of subtraction since the ANE subtraction op
-/// is unreliable at runtime. Operates on channel axis (axis 1) in NCHW layout.
 fn layer_norm(
     graph: &mut Graph,
     input: ane::Tensor,
@@ -61,7 +55,6 @@ fn layer_norm(
     graph.addition(scaled, beta_constant)
 }
 
-/// Build the GPT-2 GELU activation (tanh approximation) as ANE graph operations.
 fn gelu(graph: &mut Graph, input: ane::Tensor) -> ane::Tensor {
     let broadcast_scalar = scalar_shape();
     let half_constant = graph.constant_with_scalar(0.5, broadcast_scalar);
@@ -200,10 +193,10 @@ fn ffn_body(
         &layer_weights.fc_proj_bias,
         Shape { batch: 1, channels: embedding_dim, height: 1, width: 1 },
     );
-    graph.addition(projection, projection_bias)
+    let ffn_output = graph.addition(projection, projection_bias);
+    graph.addition(ffn_output, input)
 }
 
-/// Prefill attention: input `[C, 1, seq]` -> output `[3C, 1, seq]` (O_proj, K, V concatenated).
 pub fn build_prefill_attention(
     layer_weights: &LayerWeights,
     config: &Gpt2Config,
@@ -224,11 +217,11 @@ pub fn build_prefill_attention(
         sequence_length, sequence_length, None, None, None,
     );
 
-    let _output = graph.concat(&[o_proj, key_flat, value_flat], 1);
+    let o_proj_residual = graph.addition(o_proj, input);
+    let _output = graph.concat(&[o_proj_residual, key_flat, value_flat], 1);
     graph.compile(NSQualityOfService::Default)
 }
 
-/// Prefill FFN: input `[C, 1, seq]` -> output `[C, 1, seq]`.
 pub fn build_prefill_feed_forward(
     layer_weights: &LayerWeights,
     config: &Gpt2Config,
@@ -241,7 +234,6 @@ pub fn build_prefill_feed_forward(
     graph.compile(NSQualityOfService::Default)
 }
 
-/// Decode attention: 4 inputs -> output `[3C, 1, 64]`.
 pub fn build_decode_attention(
     layer_weights: &LayerWeights,
     config: &Gpt2Config,
@@ -267,11 +259,11 @@ pub fn build_decode_attention(
         Some(k_cache), Some(v_cache), Some(mask),
     );
 
-    let _output = graph.concat(&[o_proj, key_new_flat, value_new_flat], 1);
+    let o_proj_residual = graph.addition(o_proj, x_padded);
+    let _output = graph.concat(&[o_proj_residual, key_new_flat, value_new_flat], 1);
     graph.compile(NSQualityOfService::Default)
 }
 
-/// Decode FFN: input `[C, 1, 64]` -> output `[C, 1, 64]`.
 pub fn build_decode_feed_forward(
     layer_weights: &LayerWeights,
     config: &Gpt2Config,
@@ -280,5 +272,26 @@ pub fn build_decode_feed_forward(
     let mut graph = Graph::new();
     let input = graph.placeholder(Shape::spatial(embedding_dim, 1, DECODE_SPATIAL_WIDTH));
     let _output = ffn_body(&mut graph, input, layer_weights, config);
+    graph.compile(NSQualityOfService::Default)
+}
+
+pub fn build_lm_head(
+    ln_f_weight: &[f32],
+    ln_f_bias: &[f32],
+    wte: &[f32],
+    config: &Gpt2Config,
+) -> Result<Executable, ane::Error> {
+    let embedding_dim = config.n_embd;
+    let vocab_size = config.vocab_size;
+    let mut graph = Graph::new();
+
+    let input = graph.placeholder(Shape::spatial(embedding_dim, 1, DECODE_SPATIAL_WIDTH));
+    let normalized = layer_norm(
+        &mut graph, input,
+        ln_f_weight, ln_f_bias,
+        embedding_dim, config.layer_norm_epsilon,
+    );
+    let wte_weight = graph.constant(wte, Shape::spatial(vocab_size, 1, 1));
+    let _output = graph.convolution_2d_1x1(normalized, wte_weight, None);
     graph.compile(NSQualityOfService::Default)
 }

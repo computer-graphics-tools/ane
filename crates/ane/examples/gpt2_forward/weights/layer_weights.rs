@@ -1,4 +1,3 @@
-/// Weights for a single transformer layer.
 pub struct LayerWeights {
     pub ln1_weight: Box<[f32]>,
     pub ln1_bias: Box<[f32]>,

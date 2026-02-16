@@ -46,18 +46,8 @@ impl TensorData {
 
     /// Write fp32 data into the surface, reusing the existing allocation.
     pub fn copy_from_f32(&self, data: &[f32]) {
-        let byte_len = data.len() * 4;
-        assert!(
-            byte_len <= self.surface.allocationSize() as usize,
-            "data ({byte_len} bytes) exceeds surface allocation ({} bytes)",
-            self.surface.allocationSize(),
-        );
-        unsafe {
-            self.surface.lockWithOptions_seed(IOSurfaceLockOptions(0), ptr::null_mut());
-            let destination = self.surface.baseAddress().as_ptr().cast::<f32>();
-            ptr::copy_nonoverlapping(data.as_ptr(), destination, data.len());
-            self.surface.unlockWithOptions_seed(IOSurfaceLockOptions(0), ptr::null_mut());
-        }
+        let mut surface = self.as_f32_slice_mut();
+        surface[..data.len()].copy_from_slice(data);
     }
 
     /// Lock the surface read-only and return an RAII guard exposing `&[f32]`.
@@ -85,28 +75,6 @@ impl TensorData {
             surface: &self.surface,
             pointer,
             element_count,
-        }
-    }
-
-    /// In-place residual addition: `self[i] += other[i]` for all elements.
-    ///
-    /// Both surfaces are locked, the addition is performed directly on the
-    /// IOSurface memory, then both are unlocked. No heap allocation.
-    pub fn add_from(&self, other: &TensorData) {
-        let count = self.shape.total_elements();
-        debug_assert_eq!(count, other.shape.total_elements());
-        unsafe {
-            self.surface.lockWithOptions_seed(IOSurfaceLockOptions(0), ptr::null_mut());
-            other.surface.lockWithOptions_seed(IOSurfaceLockOptions::ReadOnly, ptr::null_mut());
-
-            let destination = self.surface.baseAddress().as_ptr().cast::<f32>();
-            let source = other.surface.baseAddress().as_ptr().cast::<f32>();
-            for index in 0..count {
-                *destination.add(index) += *source.add(index);
-            }
-
-            other.surface.unlockWithOptions_seed(IOSurfaceLockOptions::ReadOnly, ptr::null_mut());
-            self.surface.unlockWithOptions_seed(IOSurfaceLockOptions(0), ptr::null_mut());
         }
     }
 

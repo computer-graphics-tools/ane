@@ -5,7 +5,6 @@ use crate::config::Gpt2Config;
 use super::layer_weights::LayerWeights;
 use super::safetensors_ext::{tensor_to_f32, tensor_to_f32_transposed};
 
-/// All model weights: embeddings, per-layer weights, and final layer norm.
 pub struct ModelWeights {
     pub wte: Box<[f32]>,
     pub wpe: Box<[f32]>,
@@ -14,7 +13,6 @@ pub struct ModelWeights {
     pub ln_f_bias: Box<[f32]>,
 }
 
-/// Load all GPT-2 weights from safetensors, transposing Conv1D matrices.
 pub fn load_weights(safetensors: &SafeTensors, config: &Gpt2Config) -> ModelWeights {
     let embedding_dim = config.n_embd;
 

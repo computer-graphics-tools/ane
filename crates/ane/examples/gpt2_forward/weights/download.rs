@@ -6,14 +6,12 @@ use hf_hub::api::sync::ApiBuilder;
 use crate::config::Gpt2Config;
 use crate::spinner::Spinner;
 
-/// Paths and bytes downloaded from HuggingFace for the GPT-2 model.
 pub struct ModelFiles {
     pub config: Gpt2Config,
     pub tokenizer_path: PathBuf,
     pub safetensors_bytes: Vec<u8>,
 }
 
-/// Download GPT-2 model files from HuggingFace with a progress spinner.
 pub fn download_model(repo_id: &str) -> Result<ModelFiles, Box<dyn std::error::Error>> {
     let api = ApiBuilder::new().with_progress(true).build()?;
     let repo = api.model(repo_id.to_string());

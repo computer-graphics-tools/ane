@@ -1,6 +1,5 @@
 use serde::Deserialize;
 
-/// GPT-2 model configuration deserialized from HuggingFace `config.json`.
 #[derive(Debug, Deserialize)]
 pub struct Gpt2Config {
     pub n_embd: usize,

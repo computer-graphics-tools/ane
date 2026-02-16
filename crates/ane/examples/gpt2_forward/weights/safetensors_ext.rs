@@ -1,7 +1,6 @@
 use half::{bf16, f16};
 use safetensors::{Dtype, SafeTensors};
 
-/// Read a named tensor from safetensors and convert to `f32`.
 pub fn tensor_to_f32(safetensors: &SafeTensors, name: &str) -> Box<[f32]> {
     let tensor = safetensors
         .tensor(name)
@@ -24,7 +23,6 @@ pub fn tensor_to_f32(safetensors: &SafeTensors, name: &str) -> Box<[f32]> {
     }
 }
 
-/// Load and transpose a weight matrix from HF Conv1D layout `[rows, cols]` to `[cols, rows]`.
 pub fn tensor_to_f32_transposed(
     safetensors: &SafeTensors,
     name: &str,

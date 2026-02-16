@@ -3,7 +3,6 @@ use std::time::Instant;
 
 const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// A cargo-style CLI spinner that overwrites a single stderr line.
 pub struct Spinner {
     message: String,
     start: Instant,

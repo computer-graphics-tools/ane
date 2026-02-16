@@ -1,9 +1,5 @@
 use ane::{Shape, TensorData};
 
-/// Per-layer key/value cache backed by IOSurfaces for zero-copy ANE decode.
-///
-/// Each layer's K and V cache is a `TensorData` with shape `[embedding_dim, 1, max_sequence_length]`.
-/// The decode attention kernel reads these directly as placeholder inputs.
 pub struct KvCache {
     pub keys: Box<[TensorData]>,
     pub values: Box<[TensorData]>,
@@ -24,32 +20,23 @@ impl KvCache {
         }
     }
 
-    /// Write a single token's K and V vectors into the cache at the given position.
-    ///
-    /// `key_vector` and `value_vector` are `[embedding_dim]` in row-major order.
-    pub fn write_kv(
+    pub fn write_kv_from_attn(
         &self,
         layer_index: usize,
-        key_vector: &[f32],
-        value_vector: &[f32],
+        attn_data: &[f32],
+        spatial_width: usize,
         position: usize,
     ) {
-        {
-            let mut key_surface = self.keys[layer_index].as_f32_slice_mut();
-            for channel in 0..self.embedding_dim {
-                key_surface[channel * self.max_sequence_length + position] = key_vector[channel];
-            }
-        }
-        {
-            let mut value_surface = self.values[layer_index].as_f32_slice_mut();
-            for channel in 0..self.embedding_dim {
-                value_surface[channel * self.max_sequence_length + position] = value_vector[channel];
-            }
+        let mut key_surface = self.keys[layer_index].as_f32_slice_mut();
+        let mut value_surface = self.values[layer_index].as_f32_slice_mut();
+        for channel in 0..self.embedding_dim {
+            key_surface[channel * self.max_sequence_length + position] =
+                attn_data[(self.embedding_dim + channel) * spatial_width];
+            value_surface[channel * self.max_sequence_length + position] =
+                attn_data[(2 * self.embedding_dim + channel) * spatial_width];
         }
     }
 
-    /// Write K and V vectors for a contiguous range of positions from channel-first
-    /// source data with the given stride (source width may differ from `token_count`).
     pub fn write_kv_sequence(
         &self,
         layer_index: usize,

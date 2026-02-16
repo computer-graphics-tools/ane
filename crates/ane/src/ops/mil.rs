@@ -25,9 +25,6 @@ pub(crate) fn emit_mil(ops: &[Op], shapes: &[(String, Shape)]) -> (String, Box<[
         .map(|(name, shape)| (name.as_str(), *shape))
         .collect();
 
-    // Determine which blob names are network inputs vs outputs.
-    // Inputs: appear as a layer bottom but never as any layer top.
-    // Outputs: appear as a layer top but never as any subsequent layer bottom.
     let all_tops: HashSet<&str> = ops
         .iter()
         .flat_map(|l| tops(l))
@@ -59,7 +56,6 @@ pub(crate) fn emit_mil(ops: &[Op], shapes: &[(String, Shape)]) -> (String, Box<[
             acc
         });
 
-    // Collect weight blobs in layer order (same order they will be referenced).
     let mut weight_blobs: Vec<&WeightBlob> = Vec::new();
     for layer in ops.iter() {
         collect_weights(layer, &mut weight_blobs);
@@ -71,13 +67,11 @@ pub(crate) fn emit_mil(ops: &[Op], shapes: &[(String, Shape)]) -> (String, Box<[
         build_mil_weight_blob(&weight_blobs)
     };
 
-    // Build MIL text.
     let mut out = String::new();
     out.push_str("program(1.3)\n");
     out.push_str(MIL_BUILD_INFO);
     out.push_str("\n{\n");
 
-    // func signature
     out.push_str("    func main<ios18>(");
     let sig_parts: Vec<String> = input_names
         .iter()
@@ -89,11 +83,9 @@ pub(crate) fn emit_mil(ops: &[Op], shapes: &[(String, Shape)]) -> (String, Box<[
     out.push_str(&sig_parts.join(", "));
     out.push_str(") {\n");
 
-    // declare shared dtype string constants once
     out.push_str("        string _to_fp16 = const()[name = string(\"_to_fp16\"), val = string(\"fp16\")];\n");
     out.push_str("        string _to_fp32 = const()[name = string(\"_to_fp32\"), val = string(\"fp32\")];\n");
 
-    // cast each input to fp16
     for name in &input_names {
         let shape = shape_map.get(name).copied().unwrap_or(Shape::channels(1));
         out.push_str(&format!(
@@ -103,13 +95,11 @@ pub(crate) fn emit_mil(ops: &[Op], shapes: &[(String, Shape)]) -> (String, Box<[
         ));
     }
 
-    // emit each layer; track which blob index we're at
     let mut blob_index = 0usize;
     for layer in ops.iter() {
         emit_layer(layer, &shape_map, &weight_blobs, &mut blob_index, &mut out);
     }
 
-    // cast outputs from fp16 back to fp32
     for name in &output_names {
         let shape = shape_map.get(name).copied().unwrap_or(Shape::channels(1));
         out.push_str(&format!(
@@ -119,15 +109,12 @@ pub(crate) fn emit_mil(ops: &[Op], shapes: &[(String, Shape)]) -> (String, Box<[
         ));
     }
 
-    // return
     let ret = output_names.join(", ");
     out.push_str(&format!("    }} -> ({ret});\n"));
     out.push_str("}\n");
 
     (out, weight_bytes)
 }
-
-// ─── helpers ──────────────────────────────────────────────────────────────────
 
 fn mil_shape(s: Shape) -> String {
     format!("[{}, {}, {}, {}]", s.batch, s.channels, s.height, s.width)
@@ -210,7 +197,6 @@ fn emit_layer(
 
             emit_conv_constants(n, 0, 0, 0, 0, 1, 1, 1, 1, "valid", out);
 
-            // Weight: shape [out_ch, in_ch, 1, 1] — 1×1 conv
             let w_shape = format!("[{out_ch}, {in_ch}, 1, 1]");
             let w_var = format!("{n}_W");
             blobfile_ref(all_blobs, *blob_index, &w_shape, &w_var, out);
@@ -218,7 +204,6 @@ fn emit_layer(
 
             let out_sh = mil_shape(out_shape);
 
-            // Declare bias blob before conv so it can be passed inline.
             let bias_param = if l.bias.is_some() {
                 let b_shape = format!("[{out_ch}]");
                 let b_var = format!("{n}_b");
@@ -473,7 +458,6 @@ fn emit_layer(
                     ));
                 }
                 ActivationMode::SigmoidHard { alpha, beta } => {
-                    // hard_sigmoid(x) = clamp(alpha*x + beta, 0, 1)
                     out.push_str(&format!(
                         "        fp32 {n}_alpha = const()[name = string(\"{n}_alpha\"), val = fp32({alpha})];\n",
                     ));
@@ -546,9 +530,6 @@ fn emit_layer(
                 out.push_str(&format!(
                     "        tensor<fp16, {sh}> {top}_relu_f16 = relu(x = {top}_f16)[name = string(\"{n}_relu\")];\n",
                 ));
-                // rename so downstream sees the relu output as the top blob
-                // (overwrite top_f16 by reassigning — MIL doesn't allow re-binding,
-                //  so we rename in place by adding an identity cast)
                 out.push_str(&format!(
                     "        tensor<fp16, {sh}> {top}_f16_final = identity(x = {top}_relu_f16)[name = string(\"{n}_id\")];\n",
                 ));
@@ -631,20 +612,11 @@ fn emit_layer(
             let gamma_var = format!("{n}_gamma");
             let beta_var = format!("{n}_beta");
 
-            // instance_norm params blob: layout [2 * channels], first half = gamma, second = beta
-            let param_size = l.params.data.len();
-            let half = param_size / 2;
-            let _ = half; // used in documentation
-
             blobfile_ref(all_blobs, *blob_index, &gamma_shape, &gamma_var, out);
             *blob_index += 1;
 
-            // For InstanceNorm we store gamma+beta as a single blob split in two.
-            // Since we only have one blob, we use the same blob reference with different
-            // naming to declare gamma only (beta will be zeros via a constant).
             out.push_str(&format!(
                 "        tensor<fp16, [{ch}]> {beta_var} = const()[name = string(\"{beta_var}\"), val = tensor<fp16, [{ch}]>({})];\n",
-                // zero-fill beta
                 format!("[{}]", vec!["0.0"; ch as usize].join(", ")),
             ));
             out.push_str(&format!(
@@ -713,8 +685,6 @@ fn emit_layer(
                 PadFillMode::Replicate => "replicate",
             };
 
-            // pad: [Npad, 2] where each row is [before_i, after_i] for the last Npad dims.
-            // For spatial-only (h, w) padding, Npad=2.
             let (pt, pb, pl, pr) = (l.pad_top, l.pad_bottom, l.pad_left, l.pad_right);
             out.push_str(&format!(
                 "        tensor<int32, [2, 2]> {n}_amounts = const()[name = string(\"{n}_amounts\"), val = tensor<int32, [2, 2]>([{pt}, {pb}, {pl}, {pr}])];\n",

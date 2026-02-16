@@ -1,11 +1,5 @@
 use rand::{Rng, RngExt};
 
-/// Sample a token index from logits using temperature scaling, repetition
-/// penalty, and top-p (nucleus) filtering.
-///
-/// `repetition_penalty` > 1.0 discourages tokens that already appear in
-/// `generated_token_ids`.  With `temperature <= 0.0`, falls back to greedy
-/// argmax (after applying the penalty).
 pub fn sample(
     logits: &[f32],
     temperature: f32,
