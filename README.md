@@ -27,10 +27,10 @@ let result = output_tensor.read_f32();
 
 ## GPT-2 forward pass
 
-The included `gpt2_forward` binary downloads GPT-2 124M from Hugging Face, compiles the transformer layers to ANE, and runs autoregressive text generation with KV-cache:
+The included `gpt2_forward` example downloads GPT-2 124M from Hugging Face, compiles the transformer layers to ANE, and runs autoregressive text generation with KV-cache:
 
 ```
-cargo run --release --bin gpt2_forward
+cargo run --release --example gpt2_forward
 ```
 
 ## Research
