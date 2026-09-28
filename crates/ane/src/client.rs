@@ -1,18 +1,15 @@
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_foundation::{NSData, NSDictionary, NSNumber, NSQualityOfService, NSString};
-use objc2_io_surface::IOSurface;
 
+use crate::Error;
+use crate::MilProgram;
 use crate::ane_in_memory_model::ANEInMemoryModel;
 use crate::ane_in_memory_model_descriptor::ANEInMemoryModelDescriptor;
-use crate::executable::Executable;
-use crate::graph::Graph;
-use crate::io_surface::IOSurfaceExt;
-use crate::Error;
 
 static FRAMEWORK_INIT: Once = Once::new();
 static FRAMEWORK_OK: AtomicBool = AtomicBool::new(false);
@@ -36,43 +33,22 @@ fn ensure_framework() -> Result<(), Error> {
     }
 }
 
-fn nsdata_on_surface(data: &[u8]) -> (Retained<NSData>, Retained<IOSurface>) {
-    let surface = IOSurface::with_byte_count(data.len());
-    surface.write_bytes(data);
-    let nsdata = unsafe {
-        NSData::dataWithBytesNoCopy_length_freeWhenDone(
-            surface.baseAddress(),
-            data.len(),
-            false,
-        )
-    };
-    (nsdata, surface)
-}
-
-pub(crate) fn compile_network(
-    graph: &Graph,
+pub fn compile_model(
+    program: &MilProgram,
     quality_of_service: NSQualityOfService,
-) -> Result<Executable, Error> {
+) -> Result<Retained<ANEInMemoryModel>, Error> {
     ensure_framework()?;
 
-    let (ops, shapes) = graph.to_ops_and_shapes();
-    let (mil_text, weight_bytes) = crate::ops::mil::emit_mil(&ops, &shapes);
-
-    let (mil_data, _mil_surface) = nsdata_on_surface(mil_text.as_bytes());
-
-    let _weight_surface: Option<Retained<IOSurface>>;
+    let mil_text = &program.text;
+    let weight_bytes = &program.weights;
+    let mil_data = NSData::with_bytes(mil_text.as_bytes());
     let weights_dict: Retained<NSDictionary<NSString, AnyObject>> = if weight_bytes.is_empty() {
-        _weight_surface = None;
         NSDictionary::new()
     } else {
-        let (weight_data, weight_surface) = nsdata_on_surface(&weight_bytes);
-        _weight_surface = Some(weight_surface);
+        let weight_data = NSData::with_bytes(weight_bytes);
         let offset = NSNumber::new_u64(0);
         let entry: Retained<NSDictionary<NSString, AnyObject>> = NSDictionary::from_slices(
-            &[
-                &*NSString::from_str("offset"),
-                &*NSString::from_str("data"),
-            ],
+            &[&*NSString::from_str("offset"), &*NSString::from_str("data")],
             &[
                 offset.as_ref() as &AnyObject,
                 weight_data.as_ref() as &AnyObject,
@@ -94,20 +70,11 @@ pub(crate) fn compile_network(
         if !weight_bytes.is_empty() {
             let weights_dir = model_dir.join("weights");
             std::fs::create_dir_all(&weights_dir)?;
-            std::fs::write(weights_dir.join("weight.bin"), &weight_bytes)?;
+            std::fs::write(weights_dir.join("weight.bin"), weight_bytes)?;
         }
     }
 
-    model
-        .compile(quality_of_service)
-        .map_err(|error| Error::Compile(error.localizedDescription().to_string()))?;
-
-    model
-        .load(quality_of_service)
-        .map_err(|error| Error::Load(error.localizedDescription().to_string()))?;
-
-    Ok(Executable {
-        inner: model,
-        qos: quality_of_service,
-    })
+    model.compile(quality_of_service)?;
+    model.load(quality_of_service)?;
+    Ok(model)
 }

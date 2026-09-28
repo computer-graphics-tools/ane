@@ -1,31 +1,26 @@
-use objc2::encode::{Encode, Encoding};
 use objc2::rc::Retained;
 use objc2::runtime::NSObject;
-use objc2::{extern_class, extern_conformance, msg_send, ClassType};
+use objc2::{ClassType, extern_class, extern_conformance, msg_send};
 use objc2_foundation::NSObjectProtocol;
 use objc2_io_surface::IOSurface;
 
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct IOSurfaceCFRef(*const IOSurface);
-
-unsafe impl Encode for IOSurfaceCFRef {
-    const ENCODING: Encoding = Encoding::Pointer(&Encoding::Struct("__IOSurface", &[]));
-}
+#[path = "io_surface_cf_ref.rs"]
+mod io_surface_cf_ref;
+use io_surface_cf_ref::IOSurfaceCFRef;
 
 extern_class!(
     #[unsafe(super(NSObject))]
     #[name = "_ANEIOSurfaceObject"]
     #[derive(Debug, PartialEq, Eq, Hash)]
-    pub(crate) struct ANEIOSurfaceObject;
+    pub struct AneIoSurfaceObject;
 );
 
 extern_conformance!(
-    unsafe impl NSObjectProtocol for ANEIOSurfaceObject {}
+    unsafe impl NSObjectProtocol for AneIoSurfaceObject {}
 );
 
-impl ANEIOSurfaceObject {
-    pub(crate) fn with_io_surface(surface: &IOSurface) -> Option<Retained<ANEIOSurfaceObject>> {
+impl AneIoSurfaceObject {
+    pub fn with_io_surface(surface: &IOSurface) -> Option<Retained<AneIoSurfaceObject>> {
         let cf_ref = IOSurfaceCFRef(surface as *const IOSurface);
         unsafe { msg_send![Self::class(), objectWithIOSurface: cf_ref] }
     }

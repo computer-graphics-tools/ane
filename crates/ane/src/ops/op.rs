@@ -37,6 +37,7 @@ pub enum Op {
     Transpose(TransposeOp),
     SliceBySize(SliceBySizeOp),
     ScalarOp(ScalarOp),
+    StateUpdate(super::StateUpdateOp),
 }
 
 impl Op {
@@ -60,6 +61,7 @@ impl Op {
             Self::Transpose(operation) => &operation.name,
             Self::SliceBySize(operation) => &operation.name,
             Self::ScalarOp(operation) => &operation.name,
+            Self::StateUpdate(operation) => &operation.name,
         }
     }
 
@@ -83,10 +85,11 @@ impl Op {
             Self::Transpose(operation) => &operation.top,
             Self::SliceBySize(operation) => &operation.top,
             Self::ScalarOp(operation) => &operation.top,
+            Self::StateUpdate(operation) => &operation.top,
         }
     }
 
-    pub(crate) fn bottom_names(&self) -> Vec<&str> {
+    pub fn bottom_names(&self) -> Vec<&str> {
         match self {
             Self::Constant(_) => vec![],
             Self::Concat(l) => l.bottoms.iter().map(|string| string.as_str()).collect(),
@@ -106,6 +109,7 @@ impl Op {
             Self::Transpose(l) => vec![l.bottom.as_str()],
             Self::SliceBySize(l) => vec![l.bottom.as_str()],
             Self::ScalarOp(l) => vec![l.bottom.as_str()],
+            Self::StateUpdate(l) => vec![&l.bottom, &l.state, &l.position],
         }
     }
 }

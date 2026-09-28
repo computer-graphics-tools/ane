@@ -1,4 +1,4 @@
-use super::op_type::ScalarOpType;
+use super::ScalarOpType;
 
 #[derive(Clone)]
 pub struct ScalarOp {

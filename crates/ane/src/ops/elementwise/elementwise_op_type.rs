@@ -14,4 +14,5 @@ pub enum ElementwiseOpType {
     Exp = 27,
     Sub = 28,
     Div = 29,
+    Floor = 30,
 }

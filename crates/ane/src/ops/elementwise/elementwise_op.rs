@@ -1,4 +1,4 @@
-use super::op_type::ElementwiseOpType;
+use super::ElementwiseOpType;
 
 #[derive(Clone)]
 pub struct ElementwiseOp {

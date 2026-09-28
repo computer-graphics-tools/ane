@@ -38,7 +38,10 @@ pub fn load_weights(safetensors: &SafeTensors, config: &Gpt2Config) -> ModelWeig
                     embedding_dim,
                     embedding_dim,
                 ),
-                attn_proj_bias: tensor_to_f32(safetensors, &format!("{layer_prefix}.attn.c_proj.bias")),
+                attn_proj_bias: tensor_to_f32(
+                    safetensors,
+                    &format!("{layer_prefix}.attn.c_proj.bias"),
+                ),
                 ln2_weight: tensor_to_f32(safetensors, &format!("{layer_prefix}.ln_2.weight")),
                 ln2_bias: tensor_to_f32(safetensors, &format!("{layer_prefix}.ln_2.bias")),
                 fc_weight: tensor_to_f32_transposed(
@@ -54,7 +57,10 @@ pub fn load_weights(safetensors: &SafeTensors, config: &Gpt2Config) -> ModelWeig
                     4 * embedding_dim,
                     embedding_dim,
                 ),
-                fc_proj_bias: tensor_to_f32(safetensors, &format!("{layer_prefix}.mlp.c_proj.bias")),
+                fc_proj_bias: tensor_to_f32(
+                    safetensors,
+                    &format!("{layer_prefix}.mlp.c_proj.bias"),
+                ),
             }
         })
         .collect();
@@ -62,5 +68,11 @@ pub fn load_weights(safetensors: &SafeTensors, config: &Gpt2Config) -> ModelWeig
     let ln_f_weight = tensor_to_f32(safetensors, "ln_f.weight");
     let ln_f_bias = tensor_to_f32(safetensors, "ln_f.bias");
 
-    ModelWeights { wte, wpe, layers, ln_f_weight, ln_f_bias }
+    ModelWeights {
+        wte,
+        wpe,
+        layers,
+        ln_f_weight,
+        ln_f_bias,
+    }
 }

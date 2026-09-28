@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, NSObject};
-use objc2::{extern_class, extern_conformance, msg_send, ClassType};
+use objc2::{ClassType, extern_class, extern_conformance, msg_send};
 use objc2_foundation::{NSDictionary, NSError, NSObjectProtocol, NSQualityOfService, NSString};
 
 use crate::ane_in_memory_model_descriptor::ANEInMemoryModelDescriptor;
@@ -10,7 +10,7 @@ extern_class!(
     #[unsafe(super(NSObject))]
     #[name = "_ANEInMemoryModel"]
     #[derive(Debug, PartialEq, Eq, Hash)]
-    pub(crate) struct ANEInMemoryModel;
+    pub struct ANEInMemoryModel;
 );
 
 extern_conformance!(
@@ -26,6 +26,10 @@ impl ANEInMemoryModel {
         descriptor: &ANEInMemoryModelDescriptor,
     ) -> Option<Retained<ANEInMemoryModel>> {
         unsafe { msg_send![Self::class(), inMemoryModelWithDescriptor: descriptor] }
+    }
+
+    pub fn model_attributes(&self) -> Retained<NSDictionary<NSString, AnyObject>> {
+        unsafe { msg_send![self, modelAttributes] }
     }
 
     pub fn hex_string_identifier(&self) -> Option<Retained<NSString>> {
@@ -56,5 +60,17 @@ impl ANEInMemoryModel {
     pub fn unload(&self, qos: NSQualityOfService) {
         let mut err: *mut NSError = std::ptr::null_mut();
         let _: Bool = unsafe { msg_send![self, unloadWithQoS: qos.0 as u32, error: &mut err] };
+    }
+
+    pub fn map(&self, request: &ANERequest) -> Result<(), Retained<NSError>> {
+        unsafe {
+            msg_send![self, mapIOSurfacesWithRequest: request, cacheInference: true, error: _]
+        }
+    }
+
+    pub fn unmap(&self, request: &ANERequest) {
+        unsafe {
+            let _: () = msg_send![self, unmapIOSurfacesWithRequest: request];
+        }
     }
 }

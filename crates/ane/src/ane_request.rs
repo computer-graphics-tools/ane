@@ -1,15 +1,16 @@
+use block2::Block;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject};
-use objc2::{extern_class, extern_conformance, msg_send, ClassType, Message};
-use objc2_foundation::{NSArray, NSNumber, NSObjectProtocol};
+use objc2::runtime::{AnyObject, Bool, NSObject};
+use objc2::{ClassType, Message, extern_class, extern_conformance, msg_send};
+use objc2_foundation::{NSArray, NSError, NSNumber, NSObjectProtocol};
 
-use crate::ane_io_surface_object::ANEIOSurfaceObject;
+use crate::ane_io_surface_object::AneIoSurfaceObject;
 
 extern_class!(
     #[unsafe(super(NSObject))]
     #[name = "_ANERequest"]
     #[derive(Debug, PartialEq, Eq, Hash)]
-    pub(crate) struct ANERequest;
+    pub struct ANERequest;
 );
 
 extern_conformance!(
@@ -17,9 +18,16 @@ extern_conformance!(
 );
 
 impl ANERequest {
+    pub fn set_completion_handler(&self, handler: &Block<dyn Fn(Bool, *mut NSError)>) {
+        unsafe { msg_send![self, setCompletionHandler: handler] }
+    }
+
     pub fn with_multiple_io(
-        input_surfaces: &[&ANEIOSurfaceObject],
-        output_surfaces: &[&ANEIOSurfaceObject],
+        input_surfaces: &[&AneIoSurfaceObject],
+        output_surfaces: &[&AneIoSurfaceObject],
+        input_indices: &[u32],
+        output_indices: &[u32],
+        shared_events: Option<&AnyObject>,
     ) -> Option<Retained<ANERequest>> {
         let zero = NSNumber::new_u32(0);
 
@@ -36,12 +44,16 @@ impl ANERequest {
                 .collect::<Vec<_>>(),
         );
         let in_indices = NSArray::from_retained_slice(
-            &(0..input_surfaces.len() as u32)
+            &input_indices
+                .iter()
+                .copied()
                 .map(NSNumber::new_u32)
                 .collect::<Vec<_>>(),
         );
         let out_indices = NSArray::from_retained_slice(
-            &(0..output_surfaces.len() as u32)
+            &output_indices
+                .iter()
+                .copied()
                 .map(NSNumber::new_u32)
                 .collect::<Vec<_>>(),
         );
@@ -54,7 +66,8 @@ impl ANERequest {
                 outputIndices: &*out_indices,
                 weightsBuffer: Option::<&AnyObject>::None,
                 perfStats: Option::<&AnyObject>::None,
-                procedureIndex: &*zero]
+                procedureIndex: &*zero,
+                sharedEvents: shared_events]
         }
     }
 }

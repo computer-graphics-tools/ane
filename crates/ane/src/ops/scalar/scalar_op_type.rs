@@ -4,4 +4,6 @@ pub enum ScalarOpType {
     Add,
     RSub,
     Pow,
+    Min,
+    Max,
 }

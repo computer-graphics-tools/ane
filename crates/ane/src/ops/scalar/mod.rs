@@ -1,5 +1,5 @@
-mod op;
-mod op_type;
+mod scalar_op;
+mod scalar_op_type;
 
-pub use op::ScalarOp;
-pub use op_type::ScalarOpType;
+pub use scalar_op::ScalarOp;
+pub use scalar_op_type::ScalarOpType;

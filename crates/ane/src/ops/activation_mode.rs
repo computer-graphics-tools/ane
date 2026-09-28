@@ -6,7 +6,6 @@ pub enum ActivationMode {
     Sigmoid,
     Elu { alpha: f64 },
     Linear { alpha: f64, beta: f64 },
-    /// Espresso "SIGMOID_HARD": clamp(alpha * x + beta, 0, 1). Default alpha=0.2, beta=0.5.
     SigmoidHard { alpha: f64, beta: f64 },
     SoftPlus,
     SoftSign,

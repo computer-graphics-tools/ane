@@ -7,23 +7,25 @@ Provides a symbolic graph builder and a compile-then-run lifecycle through `_ANE
 ## Example
 
 ```rust
-use ane::{Graph, Shape, TensorData, NSQualityOfService};
+use ane::{Graph, TensorData, NSQualityOfService};
 
 let mut graph = Graph::new();
 
-let input   = graph.placeholder(Shape::channels(64));
-let weights = graph.constant(&weight_data, Shape { channels: 64, height: 1, width: 1, batch: 1 });
+let input   = graph.placeholder(&[1, 64, 1, 64]);
+let weights = graph.constant(&weight_data, &[1, 64, 1, 1]);
 let output  = graph.convolution_2d_1x1(input, weights, None);
 let output  = graph.relu(output);
 
 let executable = graph.compile(NSQualityOfService::Default)?;
 
-let input_tensor  = TensorData::with_f32(&data, Shape::channels(64));
-let output_tensor = TensorData::new(Shape::channels(64));
+let input_tensor  = TensorData::with_f32(&data, &[1, 64, 1, 64]);
+let output_tensor = TensorData::new(&[1, 64, 1, 64]);
 executable.run(&[&input_tensor], &[&output_tensor])?;
 
 let result = output_tensor.read_f32();
 ```
+
+Shapes are slices containing exactly four sizes in `[batch, channels, height, width]` order. The graph copies these sizes; tensor values and their memory layout are unchanged.
 
 ## GPT-2 forward pass
 

@@ -1,5 +1,5 @@
-mod op;
-mod op_type;
+mod elementwise_op;
+mod elementwise_op_type;
 
-pub use op::ElementwiseOp;
-pub use op_type::ElementwiseOpType;
+pub use elementwise_op::ElementwiseOp;
+pub use elementwise_op_type::ElementwiseOpType;

@@ -1,35 +1,19 @@
 use std::ptr;
 
+use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::AnyThread;
 use objc2_foundation::{NSDictionary, NSNumber, NSString};
 use objc2_io_surface::{
     IOSurface, IOSurfaceLockOptions, IOSurfacePropertyKeyBytesPerElement,
     IOSurfacePropertyKeyBytesPerRow, IOSurfacePropertyKeyHeight, IOSurfacePropertyKeyWidth,
 };
 
-/// Extension methods for [`IOSurface`] covering the flat byte-buffer layout used by ANE tensors.
 pub trait IOSurfaceExt {
-    /// Allocate a flat byte-buffer IOSurface with `byte_count` bytes.
-    ///
-    /// The surface is laid out as `width = byte_count`, `height = 1`,
-    /// `bytes_per_element = 1`. Because MIL function signatures use `tensor<fp32, ...>` for
-    /// I/O, pass `element_count * 4` bytes (fp32). The ANE casts to fp16 internally.
     fn with_byte_count(byte_count: usize) -> Retained<IOSurface>;
 
-    /// Copy `data` into the surface under a write lock.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `data.len()` exceeds the surface's allocated size.
     fn write_bytes(&self, data: &[u8]);
 
-    /// Copy bytes out of the surface into `buf` under a read-only lock.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `buf.len()` exceeds the surface's allocated size.
     fn read_bytes(&self, buf: &mut [u8]);
 }
 
@@ -51,8 +35,7 @@ impl IOSurfaceExt for IOSurface {
                 ],
             )
         };
-        IOSurface::initWithProperties(IOSurface::alloc(), &dict)
-            .expect("IOSurface creation failed")
+        IOSurface::initWithProperties(IOSurface::alloc(), &dict).expect("IOSurface creation failed")
     }
 
     fn write_bytes(&self, data: &[u8]) {

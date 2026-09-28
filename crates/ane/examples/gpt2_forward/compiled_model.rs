@@ -1,63 +1,74 @@
 use safetensors::SafeTensors;
 
+use crate::compiled_executables::{self, CompiledExecutables};
 use crate::config::Gpt2Config;
-use crate::executables::{
-    self, CompiledExecutables, DecodeLayer, PrefillLayer,
-};
+use crate::error::Error;
 use crate::spinner::Spinner;
 use crate::weights::{self, ModelWeights};
 
 pub struct CompiledModel {
     pub config: Gpt2Config,
-    pub weights: ModelWeights,
+    pub token_embeddings: Box<[f32]>,
+    pub position_embeddings: Box<[f32]>,
     pub executables: CompiledExecutables,
     pub max_sequence_length: usize,
+    pub padded_prompt_length: usize,
 }
 
 impl CompiledModel {
     pub fn from_safetensors(
         config: Gpt2Config,
-        safetensors: &SafeTensors,
+        bytes: Vec<u8>,
         padded_prompt_length: usize,
         max_sequence_length: usize,
-    ) -> Result<Self, ane::Error> {
-        let mut spinner = Spinner::new("Loading weights");
-        let model_weights = weights::load_weights(safetensors, &config);
-        let num_layers = config.n_layer;
+    ) -> Result<Self, Error> {
+        let spinner = Spinner::new("Loading weights");
+        let weights = weights::load_weights(&SafeTensors::deserialize(&bytes)?, &config);
+        drop(bytes);
+        spinner.finish("Loaded weights");
+        Self::from_weights(config, weights, padded_prompt_length, max_sequence_length)
+    }
 
-        let prefill: Box<[PrefillLayer]> = model_weights.layers.iter().enumerate()
-            .map(|(layer_index, layer_weights)| {
-                spinner.update(&format!("Compiling prefill layer {}/{num_layers}", layer_index + 1));
-                Ok(PrefillLayer {
-                    attention: executables::build_prefill_attention(layer_weights, &config, padded_prompt_length)?,
-                    feed_forward: executables::build_prefill_feed_forward(layer_weights, &config, padded_prompt_length)?,
-                })
-            })
-            .collect::<Result<_, ane::Error>>()?;
-
-        let decode: Box<[DecodeLayer]> = model_weights.layers.iter().enumerate()
-            .map(|(layer_index, layer_weights)| {
-                spinner.update(&format!("Compiling decode layer {}/{num_layers}", layer_index + 1));
-                Ok(DecodeLayer {
-                    attention: executables::build_decode_attention(layer_weights, &config, max_sequence_length)?,
-                    feed_forward: executables::build_decode_feed_forward(layer_weights, &config)?,
-                })
-            })
-            .collect::<Result<_, ane::Error>>()?;
-
-        spinner.update("Compiling LM head");
-        let lm_head = executables::build_lm_head(
-            &model_weights.ln_f_weight, &model_weights.ln_f_bias,
-            &model_weights.wte, &config,
+    pub fn from_weights(
+        config: Gpt2Config,
+        weights: ModelWeights,
+        padded_prompt_length: usize,
+        max_sequence_length: usize,
+    ) -> Result<Self, Error> {
+        if config.n_layer == 0
+            || config.n_head == 0
+            || !config.n_embd.is_multiple_of(config.n_head)
+            || config.head_size() < 64
+            || !config.head_size().is_multiple_of(32)
+            || padded_prompt_length < 64
+            || !padded_prompt_length.is_multiple_of(64)
+            || max_sequence_length < padded_prompt_length
+            || !max_sequence_length.is_multiple_of(64)
+            || max_sequence_length > config.n_positions
+            || config.vocab_size < 64
+            || weights.layers.len() != config.n_layer
+        {
+            return Err(Error::Input(
+                "unsupported model dimensions or context length",
+            ));
+        }
+        let mut spinner = Spinner::new("Compiling prefill");
+        let prefill = compiled_executables::build(
+            &weights,
+            &config,
+            padded_prompt_length,
+            max_sequence_length,
         )?;
-
+        spinner.update("Compiling decode");
+        let decode = compiled_executables::build(&weights, &config, 1, max_sequence_length)?;
         spinner.finish("Compiled ANE model");
-
         Ok(Self {
             config,
-            weights: model_weights,
-            executables: CompiledExecutables { prefill, decode, lm_head },
+            token_embeddings: weights.wte,
+            position_embeddings: weights.wpe,
+            executables: CompiledExecutables { prefill, decode },
             max_sequence_length,
+            padded_prompt_length,
         })
     }
 }

@@ -1,190 +1,151 @@
-use ane::{Shape, TensorData};
+use ane::{IOSurfaceExt, LockedSlice, PreparedRequest, TensorData};
+use objc2::rc::Retained;
+use objc2_io_surface::IOSurface;
 
 use crate::compiled_model::CompiledModel;
-use crate::executables::DECODE_SPATIAL_WIDTH;
-use crate::kv_cache::KvCache;
+use crate::error::Error;
 
 pub struct Session<'model> {
     model: &'model CompiledModel,
-    kv_cache: KvCache,
-    prefill_hidden: TensorData,
-    prefill_attn_delta: TensorData,
-    prefill_ffn_delta: TensorData,
-    decode_hidden: TensorData,
-    decode_attn_delta: TensorData,
-    decode_ffn_delta: TensorData,
+    prefill_request: PreparedRequest<'model>,
+    decode_request: PreparedRequest<'model>,
+    prefill_input: TensorData,
+    decode_input: TensorData,
+    selector: TensorData,
     decode_mask: TensorData,
-    lm_head_output: TensorData,
-    logits: Vec<f32>,
+    cache_position: Retained<IOSurface>,
+    output: TensorData,
     position: usize,
 }
 
 impl<'model> Session<'model> {
-    pub fn new(model: &'model CompiledModel, padded_prompt_length: usize) -> Self {
-        let embedding_dim = model.config.n_embd;
-        let max_sequence_length = model.max_sequence_length;
-
-        let prefill_hidden_shape = Shape::spatial(embedding_dim, 1, padded_prompt_length);
-        let prefill_attn_shape = Shape::spatial(3 * embedding_dim, 1, padded_prompt_length);
-
-        let decode_hidden_shape = Shape::spatial(embedding_dim, 1, DECODE_SPATIAL_WIDTH);
-        let decode_attn_shape = Shape::spatial(3 * embedding_dim, 1, DECODE_SPATIAL_WIDTH);
-        let decode_mask_shape = Shape { batch: 1, channels: 1, height: DECODE_SPATIAL_WIDTH, width: max_sequence_length };
-        let lm_head_output_shape = Shape::spatial(model.config.vocab_size, 1, DECODE_SPATIAL_WIDTH);
-
-        Self {
+    pub fn new(model: &'model CompiledModel) -> Result<Self, Error> {
+        let sequence = model.padded_prompt_length;
+        let context = model.max_sequence_length;
+        let prefill_input = TensorData::new(&[1, model.config.n_embd, 1, sequence]);
+        let decode_input = TensorData::new(&[1, 1, 1, model.config.n_embd]);
+        let prefill_mask = TensorData::with_f32(
+            &(0..sequence * context)
+                .map(|i| {
+                    if i % context <= i / context {
+                        0.0
+                    } else {
+                        -40_000.0
+                    }
+                })
+                .collect::<Vec<_>>(),
+            &[1, 1, sequence, context],
+        );
+        let decode_mask = TensorData::new(&[1, 1, 1, context]);
+        let selector = TensorData::new(&[1, 1, 1, sequence]);
+        let cache_position = IOSurface::with_byte_count(4);
+        let cache_bytes = vec![0; model.config.n_layer * model.config.n_embd * context * 2];
+        let cache = [(); 2].map(|_| {
+            let surface = IOSurface::with_byte_count(cache_bytes.len());
+            surface.write_bytes(&cache_bytes);
+            surface
+        });
+        let output = TensorData::new(&[1, 1, 1, model.config.vocab_size]);
+        let mut inputs = vec![
+            prefill_input.surface(),
+            prefill_mask.surface(),
+            &*cache_position,
+            selector.surface(),
+        ];
+        inputs.extend(cache.iter().map(|s| &**s));
+        let prefill_request = model
+            .executables
+            .prefill
+            .prepare_surfaces(&inputs, &[output.surface()])?;
+        let mut inputs = vec![
+            decode_input.surface(),
+            decode_mask.surface(),
+            &*cache_position,
+        ];
+        inputs.extend(cache.iter().map(|s| &**s));
+        let decode_request = model
+            .executables
+            .decode
+            .prepare_surfaces(&inputs, &[output.surface()])?;
+        Ok(Self {
             model,
-            kv_cache: KvCache::new(model.config.n_layer, embedding_dim, max_sequence_length),
-            prefill_hidden: TensorData::new(prefill_hidden_shape),
-            prefill_attn_delta: TensorData::new(prefill_attn_shape),
-            prefill_ffn_delta: TensorData::new(prefill_hidden_shape),
-            decode_hidden: TensorData::new(decode_hidden_shape),
-            decode_attn_delta: TensorData::new(decode_attn_shape),
-            decode_ffn_delta: TensorData::new(decode_hidden_shape),
-            decode_mask: TensorData::new(decode_mask_shape),
-            lm_head_output: TensorData::new(lm_head_output_shape),
-            logits: vec![0.0; model.config.vocab_size],
+            prefill_request,
+            decode_request,
+            prefill_input,
+            decode_input,
+            selector,
+            decode_mask,
+            cache_position,
+            output,
             position: 0,
-        }
+        })
     }
 
-    pub fn prefill(&mut self, token_ids: &[u32], real_prompt_length: usize) -> &[f32] {
-        let embedding_dim = self.model.config.n_embd;
-        let sequence_length = token_ids.len();
-
+    pub fn prefill(
+        &mut self,
+        token_ids: &[u32],
+        real_prompt_length: usize,
+    ) -> Result<LockedSlice<'_>, Error> {
+        let e = self.model.config.n_embd;
+        let sequence = self.model.padded_prompt_length;
+        if token_ids.len() != sequence
+            || real_prompt_length == 0
+            || real_prompt_length > sequence
+            || token_ids
+                .iter()
+                .any(|&t| t as usize >= self.model.config.vocab_size)
         {
-            let mut surface = self.prefill_hidden.as_f32_slice_mut();
-            embedding_lookup_into(
-                &mut surface, token_ids,
-                &self.model.weights.wte, &self.model.weights.wpe, embedding_dim,
-            );
+            return Err(Error::Input("prompt shape, length or token ID is invalid"));
         }
-
-        for (layer_index, layer) in self.model.executables.prefill.iter().enumerate() {
-            layer
-                .attention
-                .run(&[&self.prefill_hidden], &[&self.prefill_attn_delta])
-                .unwrap_or_else(|error| panic!("prefill layer {layer_index} attention: {error}"));
-
-            {
-                let attn_slice = self.prefill_attn_delta.as_f32_slice();
-                let o_proj_size = embedding_dim * sequence_length;
-
-                let key_data = &attn_slice[o_proj_size..2 * o_proj_size];
-                let value_data = &attn_slice[2 * o_proj_size..3 * o_proj_size];
-                self.kv_cache.write_kv_sequence(layer_index, key_data, value_data, real_prompt_length, sequence_length);
-
-                let mut hidden_surface = self.prefill_hidden.as_f32_slice_mut();
-                hidden_surface[..o_proj_size].copy_from_slice(&attn_slice[..o_proj_size]);
+        {
+            let mut input = self.prefill_input.as_f32_slice_mut();
+            for (position, &token) in token_ids.iter().enumerate() {
+                for channel in 0..e {
+                    input[channel * sequence + position] = self.model.token_embeddings
+                        [token as usize * e + channel]
+                        + self.model.position_embeddings[position * e + channel];
+                }
             }
-
-            layer
-                .feed_forward
-                .run(&[&self.prefill_hidden], &[&self.prefill_ffn_delta])
-                .unwrap_or_else(|error| panic!("prefill layer {layer_index} ffn: {error}"));
-            std::mem::swap(&mut self.prefill_hidden, &mut self.prefill_ffn_delta);
+            let mut selector = self.selector.as_f32_slice_mut();
+            selector.fill(0.0);
+            selector[real_prompt_length - 1] = 1.0;
         }
-
+        self.cache_position.write_bytes(&0i32.to_le_bytes());
+        self.position = 0;
+        self.prefill_request.run()?;
         self.position = real_prompt_length;
-        self.kv_cache.position = real_prompt_length;
-
         {
-            let hidden_slice = self.prefill_hidden.as_f32_slice();
-            let mut lm_input = self.decode_hidden.as_f32_slice_mut();
-            for dim_index in 0..embedding_dim {
-                lm_input[dim_index * DECODE_SPATIAL_WIDTH] =
-                    hidden_slice[dim_index * sequence_length + (real_prompt_length - 1)];
-            }
+            let mut mask = self.decode_mask.as_f32_slice_mut();
+            mask.fill(-40_000.0);
+            mask[..self.position].fill(0.0);
         }
-
-        {
-            let mut mask_surface = self.decode_mask.as_f32_slice_mut();
-            mask_surface.fill(-65504.0);
-            for col in 0..self.position {
-                mask_surface[col] = 0.0;
-            }
-        }
-
-        self.run_lm_head()
+        Ok(self.output.as_f32_slice())
     }
 
-    pub fn decode_step(&mut self, token: u32) -> &[f32] {
-        let embedding_dim = self.model.config.n_embd;
-
+    pub fn decode_step(&mut self, token: u32) -> Result<LockedSlice<'_>, Error> {
+        if self.position == 0
+            || self.position >= self.model.max_sequence_length
+            || token as usize >= self.model.config.vocab_size
         {
-            let mut hidden_surface = self.decode_hidden.as_f32_slice_mut();
-            let token_index = token as usize;
-            for dim_index in 0..embedding_dim {
-                hidden_surface[dim_index * DECODE_SPATIAL_WIDTH] =
-                    self.model.weights.wte[token_index * embedding_dim + dim_index]
-                        + self.model.weights.wpe[self.position * embedding_dim + dim_index];
+            return Err(Error::Input(
+                "prefill is required, context is full, or token ID is invalid",
+            ));
+        }
+        let e = self.model.config.n_embd;
+        {
+            let mut input = self.decode_input.as_f32_slice_mut();
+            for channel in 0..e {
+                input[channel] = self.model.token_embeddings[token as usize * e + channel]
+                    + self.model.position_embeddings[self.position * e + channel];
             }
         }
-
-        {
-            let mut mask_surface = self.decode_mask.as_f32_slice_mut();
-            mask_surface[self.position] = 0.0;
-        }
-
-        for (layer_index, layer) in self.model.executables.decode.iter().enumerate() {
-            layer
-                .attention
-                .run(
-                    &[&self.decode_hidden, &self.kv_cache.keys[layer_index], &self.kv_cache.values[layer_index], &self.decode_mask],
-                    &[&self.decode_attn_delta],
-                )
-                .unwrap_or_else(|error| panic!("decode layer {layer_index} attention: {error}"));
-
-            {
-                let attn_slice = self.decode_attn_delta.as_f32_slice();
-                self.kv_cache.write_kv_from_attn(layer_index, &attn_slice, DECODE_SPATIAL_WIDTH, self.position);
-
-                let mut hidden_surface = self.decode_hidden.as_f32_slice_mut();
-                hidden_surface.copy_from_slice(&attn_slice[..embedding_dim * DECODE_SPATIAL_WIDTH]);
-            }
-
-            layer
-                .feed_forward
-                .run(&[&self.decode_hidden], &[&self.decode_ffn_delta])
-                .unwrap_or_else(|error| panic!("decode layer {layer_index} ffn: {error}"));
-
-            std::mem::swap(&mut self.decode_hidden, &mut self.decode_ffn_delta);
-        }
-
+        self.decode_mask.as_f32_slice_mut()[self.position] = 0.0;
+        self.cache_position
+            .write_bytes(&(self.position as i32).to_le_bytes());
+        self.decode_request
+            .run()
+            .inspect_err(|_| self.position = 0)?;
         self.position += 1;
-        self.kv_cache.position = self.position;
-
-        self.run_lm_head()
-    }
-
-    fn run_lm_head(&mut self) -> &[f32] {
-        self.model.executables.lm_head
-            .run(&[&self.decode_hidden], &[&self.lm_head_output])
-            .expect("lm_head");
-
-        let vocab_size = self.model.config.vocab_size;
-        let output_slice = self.lm_head_output.as_f32_slice();
-        for v in 0..vocab_size {
-            self.logits[v] = output_slice[v * DECODE_SPATIAL_WIDTH];
-        }
-        &self.logits
-    }
-}
-
-fn embedding_lookup_into(
-    destination: &mut [f32],
-    token_ids: &[u32],
-    token_embeddings: &[f32],
-    position_embeddings: &[f32],
-    embedding_dim: usize,
-) {
-    let sequence_length = token_ids.len();
-    for seq_index in 0..sequence_length {
-        let token = token_ids[seq_index] as usize;
-        for dim_index in 0..embedding_dim {
-            destination[dim_index * sequence_length + seq_index] =
-                token_embeddings[token * embedding_dim + dim_index]
-                    + position_embeddings[seq_index * embedding_dim + dim_index];
-        }
+        Ok(self.output.as_f32_slice())
     }
 }
