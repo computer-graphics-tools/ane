@@ -10,16 +10,14 @@ authors = ["Eugene Bokhan <eugenebokhan@icloud.com>"]
 license = "MIT"
 
 [workspace.dependencies]
-ane = { path = "crates/ane" }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-hf-hub = "0.5"
-safetensors = "0.7"
-tokenizers = "0.22"
-half = "2"
+plist = "1.8"
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = { version = "1.25", features = ["extern_crate_std"] }
 rand = "0.10"
 objc2 = "0.6"
+obfstr = "0.4.6"
 objc2-foundation = { version = "0.3", features = ["NSObjCRuntime"] }
 objc2-io-surface = { version = "0.3", features = ["IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-foundation", "objc2-core-foundation", "libc"] }
 libc = "0.2"

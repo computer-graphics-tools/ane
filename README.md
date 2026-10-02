@@ -2,38 +2,35 @@
 
 Rust bindings for Apple Neural Engine (ANE) via the private `AppleNeuralEngine.framework`.
 
-Provides a symbolic graph builder and a compile-then-run lifecycle through `_ANEInMemoryModel`, using IOSurface-backed zero-copy I/O.
+Provides a typed graph builder that lowers through MPSGraph and Apple's ANE compiler, loads the result through `_ANEModel` and `_ANEClient`, and runs it on IOSurface-backed zero-copy buffers. A graph that cannot run entirely on ANE returns an error; there is no CPU or GPU fallback.
 
 ## Example
 
 ```rust
-use ane::{Graph, TensorData, NSQualityOfService};
+use ane::{DataType, Graph};
 
-let mut graph = Graph::new();
+let graph = Graph::new();
+let x = graph.placeholder([64, 64], DataType::Float32)?;
+let w = graph.constant(&weights, [64, 64])?;
+let y = graph.matrix_multiplication(&x, &w, false, false)?;
+let y = graph.relu(&y)?;
+let executable = graph.compile(&[y], &[], None)?;
 
-let input   = graph.placeholder(&[1, 64, 1, 64]);
-let weights = graph.constant(&weight_data, &[1, 64, 1, 1]);
-let output  = graph.convolution_2d_1x1(input, weights, None);
-let output  = graph.relu(output);
-
-let executable = graph.compile(NSQualityOfService::Default)?;
-
-let input_tensor  = TensorData::with_f32(&data, &[1, 64, 1, 64]);
-let output_tensor = TensorData::new(&[1, 64, 1, 64]);
-executable.run(&[&input_tensor], &[&output_tensor])?;
-
-let result = output_tensor.read_f32();
+let input = executable.input(x)?.allocate()?;
+input.copy_from_f32(&data)?;
+let results = executable.run(&[&input], None, None)?;
+let output = results[0].read_f32()?;
 ```
 
-Shapes are slices containing exactly four sizes in `[batch, channels, height, width]` order. The graph copies these sizes; tensor values and their memory layout are unchanged.
+Shapes have up to four dimensions; spatial operations use NCHW. `run` takes inputs in `executable.input_tensors()` order and returns results in target order.
 
-## GPT-2 forward pass
-
-The included `gpt2_forward` example downloads GPT-2 124M from Hugging Face, compiles the transformer layers to ANE, and runs autoregressive text generation with KV-cache:
+## Mutable weights
 
 ```
-cargo run --release --example gpt2_forward
+cargo run --release --example mutable_matmul
 ```
+
+The example binds FP16 weight IOSurfaces as inputs, rewrites them from the CPU between executions without recompiling, and checks every output exactly.
 
 ## Research
 
