@@ -9,24 +9,27 @@ Provides a typed graph builder that lowers through MPSGraph and Apple's ANE comp
 ```rust
 use ane::{DataType, Graph};
 
-let graph = Graph::new();
-let x = graph.placeholder([64, 64], DataType::Float32)?;
-let w = graph.constant(&weights, [64, 64])?;
-let y = graph.matrix_multiplication(&x, &w, false, false)?;
-let y = graph.relu(&y)?;
-let executable = graph.compile(&[y], &[], None)?;
+fn main() -> Result<(), ane::Error> {
+    let graph = Graph::new();
+    let x = graph.placeholder([64, 64], DataType::Float32)?;
+    let w = graph.constant(&[0.5; 64 * 64], [64, 64])?;
+    let y = graph.matrix_multiplication(&x, &w, false, false)?;
+    let y = graph.relu(&y)?;
+    let executable = graph.compile(&[y], &[], None)?;
 
-let input = executable.input(x)?.allocate()?;
-input.copy_from_f32(&data)?;
-let results = executable.run(&[&input], None, None)?;
-let output = results[0].read_f32()?;
+    let input = executable.input(x)?.allocate()?;
+    input.copy_from_f32(&[1.0; 64 * 64])?;
+    let results = executable.run(&[&input], None, None)?;
+    assert!(results[0].read_f32()?.iter().all(|&v| v == 32.0));
+    Ok(())
+}
 ```
 
 Shapes have up to four dimensions; spatial operations use NCHW. `run` takes inputs in `executable.input_tensors()` order and returns results in target order.
 
 ## Mutable weights
 
-```
+```sh
 cargo run --release --example mutable_matmul
 ```
 
@@ -38,4 +41,4 @@ The ANE internals research behind this crate was inspired by Mohamed Ghannam's [
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/computer-graphics-tools/ane/blob/main/LICENSE)
