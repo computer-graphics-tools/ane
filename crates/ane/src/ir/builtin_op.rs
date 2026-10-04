@@ -1,12 +1,15 @@
 use crate::DataType;
 use crate::graph::Tensor;
 use crate::graph::TensorHandle;
-use crate::ir::{ArgumentType, ConstantInput, IrError, Operator, Parameter, Value, WeightBlob};
+use std::collections::HashSet;
+
+use crate::ir::{
+    ArgumentType, ConstantInput, IrError, Operator, Operator as O, Parameter, Parameter as P, Value,
+};
 
 #[derive(Clone, PartialEq)]
 pub struct BuiltinOp {
     pub operation: Operator,
-    pub logical: bool,
     pub inputs: Box<[(Parameter, Tensor)]>,
     pub attributes: Box<[(Parameter, Value)]>,
     pub outputs: Box<[Tensor]>,
@@ -14,72 +17,6 @@ pub struct BuiltinOp {
 }
 
 impl BuiltinOp {
-    pub fn constant_data(&self) -> Result<WeightBlob, IrError> {
-        let blob = |key| self.blobs.iter().find(|b| b.name == key).unwrap();
-        use Operator as O;
-        use Parameter as P;
-        let (data, mask) = match self.operation {
-            O::ConstexprBlockwiseShiftScale => (P::Data, None),
-            O::ConstexprLutToDense => (P::Indices, None),
-            O::ConstexprSparseToDense => (P::NonzeroData, Some(P::Mask)),
-            O::SparseBlockwiseWeights => (P::NonzeroData, Some(P::DataMask)),
-            O::SparsePaletteWeights => (P::IndicesNonzeroData, Some(P::IndicesMask)),
-            _ => unreachable!("constant operation required"),
-        };
-        let shape = self.outputs[0].physical_shape();
-        let data = blob(data).data.decoded();
-        let mask = mask.map(|key| blob(key).data.bytes());
-        let palette = self
-            .blobs
-            .iter()
-            .find(|b| b.name == P::Lut)
-            .map(|b| b.data.decoded());
-        let scale = self.blobs.iter().find(|b| b.name == P::Scale);
-        let scales = scale.map(|b| b.data.decoded());
-        let offset = self
-            .blobs
-            .iter()
-            .find(|b| b.name == P::Offset)
-            .map(|b| b.data.decoded());
-        let mut source = 0;
-        let values = (0..shape.iter().product())
-            .map(|i| {
-                if mask.is_some_and(|mask| mask[i / 8] & (1 << (i % 8)) == 0) {
-                    return 0.;
-                }
-                let mut value = data[source];
-                source += 1;
-                if let Some(palette) = &palette {
-                    let layout = &blob(P::Lut).shape;
-                    let mut coordinate = i;
-                    let mut group = 0;
-                    let mut stride = 1;
-                    for axis in (0..4).rev() {
-                        group +=
-                            ((coordinate % shape[axis]) / (shape[axis] / layout[axis])) * stride;
-                        stride *= layout[axis];
-                        coordinate /= shape[axis];
-                    }
-                    value = palette[group * layout[4] + value as usize];
-                }
-                if let Some(scale) = scale {
-                    let mut coordinate = i;
-                    let mut index = 0;
-                    let mut stride = 1;
-                    for axis in (0..4).rev() {
-                        index += ((coordinate % shape[axis]) / (shape[axis] / scale.shape[axis]))
-                            * stride;
-                        stride *= scale.shape[axis];
-                        coordinate /= shape[axis];
-                    }
-                    value = (value - offset.as_ref().map_or(0., |v| v[index]))
-                        * scales.as_ref().unwrap()[index];
-                }
-                value
-            })
-            .collect::<Vec<_>>();
-        WeightBlob::from_f32(&values)
-    }
     pub fn matmul_shape(
         x: Tensor,
         y: Tensor,
@@ -111,7 +48,7 @@ impl BuiltinOp {
             parameter: parameter.as_str(),
             reason,
         };
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let mut check = |key, accepts: &dyn Fn(ArgumentType) -> bool| {
             let (_, kind, _) = schema
                 .iter()
@@ -134,18 +71,26 @@ impl BuiltinOp {
             value.validate()?;
             check(*key, &|kind| kind.accepts_value(value))?;
             if let Value::String(value) = value {
-                use Operator as O;
-                use Parameter as P;
                 let valid = match key {
                     P::Mode if self.operation == O::Gelu => {
-                        matches!(*value, "EXACT" | "TANH_APPROXIMATION")
+                        matches!(
+                            *value,
+                            "EXACT" | "TANH_APPROXIMATION" | "SIGMOID_APPROXIMATION"
+                        )
                     }
                     P::Mode => matches!(*value, "constant" | "reflect" | "symmetric" | "replicate"),
-                    P::PadType => matches!(*value, "valid" | "custom" | "same_lower"),
-                    P::SamplingMode if matches!(self.operation, O::Resample | O::Affine) => {
+                    P::PadType => matches!(*value, "valid" | "custom" | "same" | "same_lower"),
+                    P::SamplingMode if self.operation == O::Resample => {
                         matches!(*value, "nearest" | "bilinear")
                     }
-                    P::SamplingMode => matches!(*value, "UNALIGN_CORNERS"),
+                    P::SamplingMode => matches!(
+                        *value,
+                        "STRICT_ALIGN_CORNERS"
+                            | "ALIGN_CORNERS"
+                            | "DEFAULT"
+                            | "OFFSET_CORNERS"
+                            | "UNALIGN_CORNERS"
+                    ),
                     P::PaddingMode => {
                         matches!(*value, "constant" | "reflection" | "symmetric" | "border")
                     }
@@ -154,6 +99,11 @@ impl BuiltinOp {
                         "unnormalized" | "normalized_minus_one_to_one" | "normalized_zero_to_one"
                     ),
                     P::OutputIndicesDtype => *value == "uint16",
+                    P::OutputDtype
+                        if matches!(self.operation, O::ReduceArgmax | O::ReduceArgmin) =>
+                    {
+                        *value == "uint16"
+                    }
                     P::OutputDtype => matches!(*value, "int8" | "uint8"),
                     P::Dtype => matches!(
                         *value,
@@ -181,10 +131,15 @@ impl BuiltinOp {
                 return Err(error(key, "required argument is missing"));
             }
         }
-        let expected = if self.operation == Operator::Topk {
-            2
-        } else {
-            1
+        let sizes = self
+            .attributes
+            .iter()
+            .find(|(key, _)| *key == P::SplitSizes)
+            .map(|(_, value)| value);
+        let expected = match (self.operation, sizes) {
+            (Operator::Topk, _) => 2,
+            (Operator::Split, Some(Value::Int32List(sizes))) => sizes.len(),
+            _ => 1,
         };
         if self.outputs.len() != expected {
             return Err(IrError::InvalidProgram(
@@ -217,8 +172,6 @@ impl BuiltinOp {
                 ))
             }
         };
-        use Operator as O;
-        use Parameter as P;
         let expected_dtype = match self.operation {
             O::Equal
             | O::NotEqual
@@ -226,9 +179,8 @@ impl BuiltinOp {
             | O::LessEqual
             | O::Greater
             | O::GreaterEqual
-            | O::LogicalNot
-            | O::LogicalAnd
-            | O::LogicalOr => DataType::Bool,
+            | O::LogicalAnd => DataType::Bool,
+            O::ReduceArgmax | O::ReduceArgmin => DataType::UInt16,
             O::Select => input(P::A).unwrap().data_type(),
             O::Cast | O::Quantize => output.data_type(),
             O::Reshape
@@ -240,8 +192,9 @@ impl BuiltinOp {
             | O::Reverse
             | O::Gather
             | O::GatherAlongAxis
-            | O::GatherNd => input(P::X).unwrap().data_type(),
-            O::Concat => input(P::Values).unwrap().data_type(),
+            | O::SliceUpdate
+            | O::Split => input(P::X).unwrap().data_type(),
+            O::Concat | O::Stack => input(P::Values).unwrap().data_type(),
             _ => DataType::Float16,
         };
         require(output.data_type() == expected_dtype)?;
@@ -293,14 +246,9 @@ impl BuiltinOp {
             | O::LessEqual
             | O::Greater
             | O::GreaterEqual
-            | O::LogicalAnd
-            | O::LogicalOr => require(
+            | O::LogicalAnd => require(
                 output.data_type() == DataType::Bool
                     && input(P::X).unwrap().data_type() == input(P::Y).unwrap().data_type(),
-            ),
-            O::LogicalNot => require(
-                output.data_type() == DataType::Bool
-                    && output.shape() == input(P::X).unwrap().shape(),
             ),
             O::Select => require(
                 output.data_type() == input(P::A).unwrap().data_type()

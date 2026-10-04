@@ -1,6 +1,7 @@
 use crate::apple_neural_engine::ANEDeviceInfo;
 use crate::device::DeviceError;
 use std::ffi::CStr;
+use std::io;
 
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
@@ -39,7 +40,7 @@ fn system_string(name: &CStr) -> Result<String, DeviceError> {
         )
     };
     if result != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(io::Error::last_os_error().into());
     }
     let mut bytes = vec![0u8; length];
     let result = unsafe {
@@ -52,7 +53,7 @@ fn system_string(name: &CStr) -> Result<String, DeviceError> {
         )
     };
     if result != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(io::Error::last_os_error().into());
     }
     bytes.truncate(length);
     if bytes.last() == Some(&0) {

@@ -37,27 +37,17 @@ impl TensorData {
             .map_err(|_| TensorDataError::InvalidBitPattern)
     }
 
-    pub fn new<const RANK: usize>(shape: [usize; RANK]) -> Result<Self, TensorDataError> {
-        Self::with_type(shape, DataType::Float32)
-    }
     pub fn with_type<const RANK: usize>(
         shape: [usize; RANK],
         dtype: DataType,
     ) -> Result<Self, TensorDataError> {
         TensorSpec::new("", logical_shape(&shape), dtype)?.allocate()
     }
-    pub fn with_f32<const RANK: usize>(
-        data: &[f32],
-        shape: [usize; RANK],
-    ) -> Result<Self, TensorDataError> {
-        let tensor = Self::new(shape)?;
-        tensor.copy_from_f32(data)?;
-        Ok(tensor)
-    }
-    #[allow(
-        clippy::missing_safety_doc,
-        reason = "external synchronization contract is in README"
-    )]
+    /// # Safety
+    ///
+    /// External CPU, GPU and device users of the surface must be synchronized with this crate,
+    /// the surface allocation must stay at least as large as the layout, and every element
+    /// that is read must be initialized.
     pub unsafe fn from_surface<const RANK: usize>(
         surface: Retained<IOSurface>,
         shape: [usize; RANK],
@@ -65,10 +55,11 @@ impl TensorData {
     ) -> Result<Self, TensorDataError> {
         unsafe { Self::from_layout(surface, TensorSpec::new("", logical_shape(&shape), dtype)?) }
     }
-    #[allow(
-        clippy::missing_safety_doc,
-        reason = "external synchronization contract is in README"
-    )]
+    /// # Safety
+    ///
+    /// External CPU, GPU and device users of the surface must be synchronized with this crate,
+    /// the surface allocation must stay at least as large as the layout, and every element
+    /// that is read must be initialized.
     pub unsafe fn from_layout(
         surface: Retained<IOSurface>,
         spec: TensorSpec,

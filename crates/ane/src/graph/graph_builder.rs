@@ -1,5 +1,5 @@
 use crate::graph::{GraphError, checked_shape, ensure};
-use crate::ir::{Op, Operator, Parameter, Value, WeightBlob};
+use crate::ir::{ConstantInput, Operator, Parameter, Value, WeightBlob};
 use std::cell::RefMut;
 
 use crate::DataType;
@@ -28,17 +28,6 @@ pub trait GraphBuilder {
     ) -> Result<Vec<Tensor>, GraphError> {
         self.state()
             .builtin_many(operation, inputs, attributes, shapes, Box::new([]))
-    }
-
-    fn logical_builtin(
-        &self,
-        operation: Operator,
-        inputs: &[(Parameter, Tensor)],
-        attributes: &[(Parameter, Value)],
-        shapes: &[(DataType, &[usize])],
-    ) -> Result<Vec<Tensor>, GraphError> {
-        self.state()
-            .logical_builtin(operation, inputs, attributes, shapes)
     }
 
     fn numeric(&self, tensor: Tensor) -> Result<(), GraphError> {
@@ -88,13 +77,8 @@ pub trait GraphBuilder {
         let tensor = state.alloc_rank(physical, shape.len());
         state
             .constants
-            .insert(tensor.id(), (WeightBlob::from_f32(data)?, physical));
+            .insert(tensor.id(), WeightBlob::from_f32(data)?);
         Ok(tensor)
-    }
-
-    fn constant_scalar(&self, scalar: f32, shape: &[usize]) -> Result<Tensor, GraphError> {
-        let count = checked_shape(shape)?.iter().product();
-        self.constant_values(&vec![scalar; count], shape)
     }
 
     fn reshape_to(&self, input: Tensor, shape: &[usize]) -> Result<Tensor, GraphError> {
@@ -113,17 +97,13 @@ pub trait GraphBuilder {
         )
     }
 
-    fn unary(&self, input: Tensor, operation: Operator) -> Result<Tensor, GraphError> {
+    fn unary(
+        &self,
+        input: Tensor,
+        operation: Operator,
+        attributes: &[(Parameter, Value)],
+    ) -> Result<Tensor, GraphError> {
         self.numeric(input)?;
-        let epsilon = [(Parameter::Epsilon, Value::Fp16(0.0))];
-        let attributes = if matches!(
-            operation,
-            Operator::Log | Operator::Inverse | Operator::Rsqrt
-        ) {
-            &epsilon[..]
-        } else {
-            &[]
-        };
         self.builtin(
             operation,
             &[(Parameter::X, input)],
@@ -133,65 +113,38 @@ pub trait GraphBuilder {
         )
     }
 
-    fn ranked(
+    fn constant_input(
         &self,
-        input: Tensor,
-        k: usize,
-        axis: i64,
-        ascending: bool,
-    ) -> Result<(Tensor, Tensor), GraphError> {
-        self.numeric(input)?;
-        let axis = self.axis(input, axis)?;
+        tensor: Tensor,
+        name: Parameter,
+        shape: &[usize],
+    ) -> Result<ConstantInput, GraphError> {
+        self.check_tensor(tensor)?;
+        let data = self.state().constants.get(&tensor.id()).cloned().ok_or(
+            GraphError::NonConstantWeights("this MIL argument must be a constant tensor"),
+        )?;
         ensure(
-            k > 0 && k <= input.physical_shape()[axis] && input.physical_shape()[axis] <= 2048,
-            GraphError::OutOfBounds(
-                "native top-k indices are exact only for axis lengths up to 2048; split larger axes into tiles",
-            ),
+            data.element_count() == shape.iter().product::<usize>(),
+            GraphError::ShapeMismatch("constant argument size differs from its MIL shape"),
         )?;
-        let mut shape = input.physical_shape();
-        shape[axis] = k;
-        let logical = &shape[4 - input.rank()..];
-        let outputs = self.builtin_many(
-            Operator::Topk,
-            &[(Parameter::X, input)],
-            &[
-                (Parameter::K, Value::Int32(k)),
-                (Parameter::Axis, Value::Int32(axis)),
-                (Parameter::Ascending, Value::Bool(ascending)),
-                (Parameter::Sort, Value::Bool(true)),
-                (Parameter::ReturnIndices, Value::Bool(true)),
-                (Parameter::OutputIndicesDtype, Value::String("uint16")),
-            ],
-            &[(DataType::Float16, logical), (DataType::UInt16, logical)],
-        )?;
-        Ok((outputs[0], outputs[1]))
+        Ok((name, shape.into(), data).into())
     }
 
-    fn convolution_bias(
+    fn builtin_with_constants(
         &self,
-        output: Tensor,
-        bias: Option<Tensor>,
-        channels: usize,
+        operation: Operator,
+        inputs: &[(Parameter, Tensor)],
+        attributes: &[(Parameter, Value)],
+        constants: Vec<ConstantInput>,
+        shape: &[usize],
+        dtype: DataType,
     ) -> Result<Tensor, GraphError> {
-        if let Some(bias) = bias {
-            self.check_tensor(bias)?;
-            ensure(
-                bias.physical_shape().iter().product::<usize>() == channels,
-                GraphError::ShapeMismatch("convolution bias count differs"),
-            )?;
-            let blob = self
-                .state()
-                .constants
-                .get(&bias.id())
-                .ok_or(GraphError::NonConstantWeights(
-                    "convolution bias must be constant",
-                ))?
-                .0
-                .clone();
-            if let Some((Op::Builtin(op), _)) = self.state().ops.last_mut() {
-                op.blobs = vec![(Parameter::Bias, vec![channels].into(), blob).into()].into();
-            }
-        }
-        Ok(output)
+        Ok(self.state().builtin_many(
+            operation,
+            inputs,
+            attributes,
+            &[(dtype, shape)],
+            constants.into(),
+        )?[0])
     }
 }

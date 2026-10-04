@@ -1,14 +1,12 @@
 use std::sync::Arc;
-use std::task::Waker;
 
 use crate::io_surface::SurfaceLease;
-use crate::{Error, request::Request};
+use crate::{Outcome, Request};
 
 #[derive(Default)]
 pub struct CompletionState {
     pub request: Option<Arc<Request>>,
+    pub outcome: Option<Arc<Outcome>>,
     pub leases: Vec<SurfaceLease>,
-    pub result: Option<Result<(), Error>>,
-    pub waker: Option<Waker>,
     pub event_value: u64,
 }

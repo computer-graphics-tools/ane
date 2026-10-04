@@ -1,3 +1,5 @@
+use std::io;
+
 use crate::{
     AneError, DeviceError, GraphError, IOSurfaceError, IrError, SharedEventError, TensorDataError,
 };
@@ -24,10 +26,6 @@ pub enum Error {
     Unbound(&'static str),
     #[error("a written buffer cannot alias another binding")]
     Alias,
-    #[error("compilation cache limits must be positive")]
-    CacheLimits,
-    #[error("compiled source of {bytes} bytes exceeds the cache limit of {limit} bytes")]
-    CacheOverflow { bytes: usize, limit: usize },
     #[error(transparent)]
     Ane(#[from] AneError),
 
@@ -57,7 +55,7 @@ pub enum Error {
     PropertyList(#[from] plist::Error),
 
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 }
 
 pub fn require(condition: bool, error: Error) -> Result<(), Error> {

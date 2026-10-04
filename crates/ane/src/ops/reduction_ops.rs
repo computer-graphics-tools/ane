@@ -43,101 +43,82 @@ impl Graph {
         )
     }
 
-    pub fn reduction_sum(&self, input: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
-        self.reduce(*input, Operator::ReduceSum, &[axis])
-    }
-
-    pub fn reduction_mean(&self, input: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
-        self.reduce(*input, Operator::ReduceMean, &[axis])
-    }
-
-    pub fn reduction_minimum(&self, input: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
-        self.reduce(*input, Operator::ReduceMin, &[axis])
-    }
-
-    pub fn reduction_maximum(&self, input: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
-        self.reduce(*input, Operator::ReduceMax, &[axis])
-    }
-
-    pub fn sum(&self, x: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
+    /// Sum over `axes`, kept as size 1. MIL `reduce_sum`.
+    pub fn reduction_sum(&self, x: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
         self.reduce(*x, Operator::ReduceSum, axes)
     }
 
-    pub fn mean(&self, x: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
+    /// Mean over `axes`, kept as size 1. MIL `reduce_mean`.
+    pub fn reduction_mean(&self, x: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
         self.reduce(*x, Operator::ReduceMean, axes)
     }
 
-    pub fn variance(&self, x: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
-        let mean = self.mean(x, axes)?;
-        let centered = self.subtraction(x, &mean)?;
-        let squared = self.square(&centered)?;
-        self.mean(&squared, axes)
+    /// Minimum over `axes`, kept as size 1. MIL `reduce_min`.
+    pub fn reduction_minimum(&self, x: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
+        self.reduce(*x, Operator::ReduceMin, axes)
     }
 
-    pub fn reduction_sum_square(&self, x: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
-        let squared = self.square(x)?;
-        self.reduction_sum(&squared, axis)
+    /// Maximum over `axes`, kept as size 1. MIL `reduce_max`.
+    pub fn reduction_maximum(&self, x: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
+        self.reduce(*x, Operator::ReduceMax, axes)
     }
 
-    pub fn reduction_l1_norm(&self, x: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
-        let absolute = self.absolute(x)?;
-        self.reduction_sum(&absolute, axis)
+    /// `Σ|x|` over `axes`, kept as size 1. MIL `reduce_l1_norm`.
+    pub fn reduction_l1_norm(&self, x: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
+        self.reduce(*x, Operator::ReduceL1Norm, axes)
     }
 
-    pub fn reduction_l2_norm(&self, x: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
-        let squared = self.reduction_sum_square(x, axis)?;
-        self.square_root(&squared)
+    /// `sqrt(Σx²)` over `axes`, kept as size 1. MIL `reduce_l2_norm`.
+    pub fn reduction_l2_norm(&self, x: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
+        self.reduce(*x, Operator::ReduceL2Norm, axes)
     }
 
-    pub fn reduction_log_sum(&self, x: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
-        let sum = self.reduction_sum(x, axis)?;
-        self.logarithm(&sum)
+    /// `ln(Σx)` over `axes`, kept as size 1. MIL `reduce_log_sum`.
+    pub fn reduction_log_sum(&self, x: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
+        self.reduce(*x, Operator::ReduceLogSum, axes)
     }
 
-    pub fn reduction_log_sum_exp(&self, x: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
-        let max = self.reduction_maximum(x, axis)?;
-        let centered = self.subtraction(x, &max)?;
-        let exp = self.exponent(&centered)?;
-        let sum = self.reduction_sum(&exp, axis)?;
-        let log = self.logarithm(&sum)?;
-        self.addition(&log, &max)
+    /// `ln(Σe^x)` over `axes`, kept as size 1. MIL `reduce_log_sum_exp`.
+    pub fn reduction_log_sum_exp(&self, x: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
+        self.reduce(*x, Operator::ReduceLogSumExp, axes)
     }
 
-    pub fn reduction_arg_maximum(&self, input: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
-        Ok(self.top_k(input, 1, axis)?.1)
+    /// `Σx²` over `axes`, kept as size 1. MIL `reduce_sum_square`.
+    pub fn reduction_sum_square(&self, x: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
+        self.reduce(*x, Operator::ReduceSumSquare, axes)
     }
 
-    pub fn reduction_arg_minimum(&self, input: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
-        Ok(self.bottom_k(input, 1, axis)?.1)
+    /// UInt16 index of the maximum along `axis`, kept as size 1; the axis has at most 2048 elements.
+    /// MIL `reduce_argmax`.
+    pub fn reduction_arg_maximum(&self, x: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
+        self.reduce_arg(*x, axis, Operator::ReduceArgmax)
     }
 
-    pub fn reduction_product(&self, input: &Tensor, axis: usize) -> Result<Tensor, GraphError> {
-        self.numeric(*input)?;
-        self.axis(*input, axis as i64)?;
-        let mut current = *input;
-        while current.shape()[axis] > 1 {
-            let length = current.shape()[axis];
-            let pairs = length / 2;
-            let mut chunks = Vec::new();
-            for i in 0..pairs {
-                let mut begin = vec![0; input.rank()];
-                let mut shape = current.shape().to_vec();
-                shape[axis] = 1;
-                begin[axis] = 2 * i;
-                let a = self.slice(&current, &begin, &shape)?;
-                begin[axis] += 1;
-                let b = self.slice(&current, &begin, &shape)?;
-                chunks.push(self.multiplication(&a, &b)?);
-            }
-            if !length.is_multiple_of(2) {
-                let mut begin = vec![0; input.rank()];
-                let mut shape = current.shape().to_vec();
-                shape[axis] = 1;
-                begin[axis] = length - 1;
-                chunks.push(self.slice(&current, &begin, &shape)?);
-            }
-            current = self.concat(&chunks.iter().collect::<Vec<_>>(), axis)?;
-        }
-        Ok(current)
+    /// UInt16 index of the minimum along `axis`, kept as size 1; the axis has at most 2048 elements.
+    /// MIL `reduce_argmin`.
+    pub fn reduction_arg_minimum(&self, x: &Tensor, axis: i64) -> Result<Tensor, GraphError> {
+        self.reduce_arg(*x, axis, Operator::ReduceArgmin)
+    }
+
+    fn reduce_arg(&self, x: Tensor, axis: i64, operation: Operator) -> Result<Tensor, GraphError> {
+        self.numeric(x)?;
+        let axis = self.axis(x, axis)?;
+        ensure(
+            x.physical_shape()[axis] <= 2048,
+            GraphError::OutOfBounds("ANE index results are exact only for axes up to 2048"),
+        )?;
+        let mut shape = x.physical_shape();
+        shape[axis] = 1;
+        self.builtin(
+            operation,
+            &[(Parameter::X, x)],
+            &[
+                (Parameter::Axis, Value::Int32(axis)),
+                (Parameter::KeepDims, Value::Bool(true)),
+                (Parameter::OutputDtype, Value::String("uint16")),
+            ],
+            &shape[4 - x.rank()..],
+            DataType::UInt16,
+        )
     }
 }

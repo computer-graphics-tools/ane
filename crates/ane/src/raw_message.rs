@@ -17,7 +17,7 @@ macro_rules! raw_message {
 }
 
 macro_rules! raw_class {
-    ($name:ident, $class:literal) => {
+    ($name:ident) => {
         #[repr(transparent)]
         #[derive(PartialEq, Eq, Hash)]
         pub struct $name(objc2::runtime::NSObject);
@@ -33,6 +33,9 @@ macro_rules! raw_class {
                 std::fmt::Debug::fmt(&self.0, f)
             }
         }
+    };
+    ($name:ident, $class:literal) => {
+        raw_class!($name);
 
         impl $name {
             fn class() -> &'static objc2::runtime::AnyClass {

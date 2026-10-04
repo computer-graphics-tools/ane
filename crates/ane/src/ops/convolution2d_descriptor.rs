@@ -1,16 +1,23 @@
 use crate::PadMode;
 use crate::graph::{GraphError, checked_shape, ensure};
 
+/// Geometry of a 2-D convolution.
 #[derive(Clone, Debug)]
 pub struct Convolution2dDescriptor {
+    /// Channel groups; input and output channels must divide by it.
     pub groups: usize,
+    /// Vertical and horizontal stride.
     pub strides: [usize; 2],
+    /// Vertical and horizontal kernel dilation.
     pub dilations: [usize; 2],
+    /// Explicit `[top, bottom, left, right]` padding.
     pub padding: [usize; 4],
+    /// `Same` pads to `ceil(input / stride)` outputs; `Valid` uses `padding`.
     pub pad_mode: PadMode,
 }
 
 impl Convolution2dDescriptor {
+    /// Output shape for an `[N, C, H, W]` input and `[Cout, Cin / groups, kH, kW]` weights.
     pub fn output_shape(
         &self,
         input: [usize; 4],

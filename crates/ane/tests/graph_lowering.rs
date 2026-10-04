@@ -1,7 +1,7 @@
 use ane::{
     BlockwiseQuantization, Convolution2dDescriptor, ConvolutionTranspose2dDescriptor, DataType,
-    Graph, GraphError, PadFillMode, PadMode, PoolType, Pooling2dDescriptor, SamplingDescriptor,
-    SamplingMode, Tensor, TensorData, WeightDataType,
+    GeluMode, Graph, GraphError, PadFillMode, PadMode, Palettization, Pooling2dDescriptor,
+    ResizeSamplingMode, SamplingDescriptor, Tensor, TensorData, WeightDataType,
 };
 
 #[path = "graph_lowering/case.rs"]
@@ -26,6 +26,9 @@ fn c<const RANK: usize>(g: &Graph, shape: [usize; RANK]) -> Result<Tensor, Graph
     let data: Vec<f32> = (0..count).map(|i| 0.25 + i as f32 * 0.125).collect();
     g.constant(&data, shape)
 }
+fn int8_blocks() -> BlockwiseQuantization<'static, 2> {
+    BlockwiseQuantization::new(WeightDataType::Int8, &[0.1, 0.2, 0.3, 0.4], [4, 1])
+}
 
 macro_rules! unary {
     ($($name:ident),* $(,)?) => {
@@ -38,61 +41,37 @@ macro_rules! binary {
     };
 }
 macro_rules! scalar {
-    ($($name:ident($value:expr)),* $(,)?) => {
-        &[$( (stringify!($name), |g: &Graph| { let x = x4(g)?; Ok(vec![g.$name(&x, $value)?]) }) ),*]
+    ($($name:ident($($value:expr),+)),* $(,)?) => {
+        &[$( (concat!(stringify!($name), "(", stringify!($($value),+), ")"), |g: &Graph| { let x = x4(g)?; Ok(vec![g.$name(&x, $($value),+)?]) }) ),*]
     };
 }
-macro_rules! axis {
+macro_rules! reduce {
     ($($name:ident),* $(,)?) => {
-        &[$( (stringify!($name), |g: &Graph| { let x = x4(g)?; Ok(vec![g.$name(&x, -1)?]) }) ),*]
-    };
-}
-macro_rules! boolean {
-    ($($name:ident),* $(,)?) => {
-        &[$( (stringify!($name), |g: &Graph| {
-            let x = typed(g, [2, 3], DataType::Bool)?;
-            let y = typed(g, [2, 3], DataType::Bool)?;
-            Ok(vec![g.$name(&x, &y)?])
-        }) ),*]
+        &[$( (stringify!($name), |g: &Graph| { let x = x4(g)?; Ok(vec![g.$name(&x, &[-1, -2])?]) }) ),*]
     };
 }
 
 const UNARY: &[(&str, Case)] = unary!(
-    relu,
-    tanh,
-    sigmoid,
-    softplus,
-    softsign,
     absolute,
-    square_root,
-    reciprocal_square_root,
-    exponent,
-    logarithm,
-    reciprocal,
-    floor,
+    atan,
     ceil,
+    cos,
+    erf,
+    exponent,
+    exponent_base2,
+    floor,
     round,
     sign,
-    square,
-    negative,
-    erf,
-    exponent_base2,
     sin,
-    cos,
-    atan,
-    tan,
+    square_root,
+    square,
+    relu,
     relu6,
+    sigmoid,
     silu,
-    gelu,
-    gelu_exact,
-    truncate,
-    logarithm_base2,
-    logarithm_base10,
-    exponent_base10,
-    hard_swish,
-    identity,
-    global_avg_pool,
-    global_max_pool,
+    softplus,
+    softsign,
+    tanh,
 );
 const BINARY: &[(&str, Case)] = binary!(
     addition,
@@ -102,45 +81,65 @@ const BINARY: &[(&str, Case)] = binary!(
     power,
     maximum,
     minimum,
-    floor_divide,
-    prelu,
     equal,
     not_equal,
     less_than,
     less_than_or_equal_to,
     greater_than,
     greater_than_or_equal_to,
-    reshape_like,
 );
 const SCALAR: &[(&str, Case)] = scalar!(
-    multiply_scalar(2.5),
-    add_scalar(-1.0),
-    reverse_subtract_scalar(3.0),
-    power_scalar(2.0),
-    minimum_scalar(0.5),
-    maximum_scalar(0.5),
-    thresholded_relu(0.5),
-    fill_like(0.75),
+    logarithm(1e-4),
+    reciprocal(1e-4),
+    reciprocal_square_root(1e-4),
+    l2_normalize(1e-5),
+    soft_max(-1),
+    clamp(-1.0, 1.0),
     leaky_relu(0.1),
     elu(1.0),
-    threshold(0.5),
+    thresholded_relu(0.5),
+    linear_activation(2.0, 1.0),
+    hard_sigmoid(0.2, 0.5),
+    scaled_tanh(1.0, 2.0),
+    clamped_relu(0.1, 6.0),
+    gelu(GeluMode::Exact),
+    gelu(GeluMode::TanhApproximation),
+    gelu(GeluMode::SigmoidApproximation),
+    local_response_norm(2, 1e-4, 0.75, 1.0),
+    reduction_arg_maximum(-1),
+    reduction_arg_minimum(1),
+    resize_nearest([8, 8]),
+    resize_bilinear([8, 8], ResizeSamplingMode::Default),
+    resize_bilinear([8, 8], ResizeSamplingMode::StrictAlignCorners),
+    resize_bilinear([8, 8], ResizeSamplingMode::AlignCorners),
+    resize_bilinear([8, 8], ResizeSamplingMode::OffsetCorners),
+    resize_bilinear([8, 8], ResizeSamplingMode::UnalignCorners),
+    space_to_depth(2),
+    space_to_batch([2, 2], [0, 0, 0, 0]),
+    pad([1, 1, 1, 1], PadFillMode::Constant, 0.5),
+    pad([1, 1, 1, 1], PadFillMode::Reflect, 0.0),
+    pad([1, 1, 1, 1], PadFillMode::Replicate, 0.0),
+    reverse(&[1, 3]),
+    tile(&[1, 2, 1, 1]),
+    transpose([0, 2, 1, 3]),
+    reshape([2, 16]),
+    slice([0, 0, 1, 1], [1, 2, 2, 2]),
+    strided_slice(&[0, 0, 0, 1], &[1, 2, 4, 4], &[1, 1, 2, 2]),
+    max_pooling_2d(&Pooling2dDescriptor::new([2, 2], [2, 2])),
+    avg_pooling_2d(&Pooling2dDescriptor::new([3, 3], [1, 1])),
+    l2_norm_pooling_2d(&Pooling2dDescriptor::new([2, 2], [2, 2])),
 );
-const AXIS: &[(&str, Case)] = axis!(
-    soft_max,
+const REDUCE: &[(&str, Case)] = reduce!(
     reduction_sum,
     reduction_mean,
     reduction_minimum,
     reduction_maximum,
-    reduction_sum_square,
     reduction_l1_norm,
     reduction_l2_norm,
     reduction_log_sum,
     reduction_log_sum_exp,
-    log_softmax,
-    reduction_arg_maximum,
-    reduction_arg_minimum,
+    reduction_sum_square,
 );
-const BOOLEAN: &[(&str, Case)] = boolean!(logical_and, logical_or, logical_xor);
 
 const SPECIAL: &[(&str, Case)] = &[
     ("placeholder_f32", |g| {
@@ -160,67 +159,27 @@ const SPECIAL: &[(&str, Case)] = &[
         let k = g.constant_with_bytes(&[0x3c; 12], [2, 3], DataType::Float16)?;
         Ok(vec![g.addition(&x, &k)?])
     }),
-    ("constant_scalar", |g| {
-        let x = h(g, [2, 3])?;
-        let k = g.constant_with_scalar(2.0, [2, 3])?;
-        Ok(vec![g.multiplication(&x, &k)?])
-    }),
-    ("fill", |g| {
-        let x = h(g, [2, 3])?;
-        let k = g.constant_with_scalar(1.5, [2, 3])?;
-        Ok(vec![g.addition(&x, &k)?])
-    }),
-    ("range", |g| {
-        let x = h(g, [4])?;
-        let k = g.range(0.0, 1.0, 4)?;
-        Ok(vec![g.addition(&x, &k)?])
-    }),
-    ("coordinate", |g| {
-        let x = h(g, [2, 3])?;
-        let k = g.coordinate_along_axis([2, 3], 1)?;
-        Ok(vec![g.addition(&x, &k)?])
-    }),
-    ("boolean_constant", |g| {
-        let x = x4(g)?;
-        let y = x4(g)?;
-        let b = g.boolean_constant(true)?;
-        Ok(vec![g.select(&b, &x, &y)?])
-    }),
-    ("hard_sigmoid", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.hard_sigmoid(&x, 0.2, 0.5)?])
-    }),
-    ("linear", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.linear_activation(&x, 2.0, 1.0)?])
-    }),
-    ("clip", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.clamp(&x, -1.0, 1.0)?])
-    }),
-    ("clamped_relu", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.clamped_relu(&x, 0.1, 6.0)?])
-    }),
-    ("scaled_tanh", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.scaled_tanh(&x, 1.0, 2.0)?])
-    }),
-    ("softplus_parametric", |g| {
-        let x = x4(g)?;
-        let a = c(g, [1, 2, 1, 1])?;
-        let b = c(g, [1, 2, 1, 1])?;
-        Ok(vec![g.softplus_parametric(&x, &a, &b)?])
-    }),
-    ("logical_not", |g| {
-        let b = typed(g, [2, 3], DataType::Bool)?;
-        Ok(vec![g.not(&b)?])
+    ("logical_and", |g| {
+        let x = typed(g, [2, 3], DataType::Bool)?;
+        let y = typed(g, [2, 3], DataType::Bool)?;
+        Ok(vec![g.logical_and(&x, &y)?])
     }),
     ("select", |g| {
         let b = typed(g, [1, 2, 4, 4], DataType::Bool)?;
         let x = x4(g)?;
         let y = x4(g)?;
         Ok(vec![g.select(&b, &x, &y)?])
+    }),
+    ("prelu", |g| {
+        let x = x4(g)?;
+        let a = c(g, [2])?;
+        Ok(vec![g.prelu(&x, &a)?])
+    }),
+    ("softplus_parametric", |g| {
+        let x = x4(g)?;
+        let a = c(g, [2])?;
+        let b = c(g, [2])?;
+        Ok(vec![g.softplus_parametric(&x, &a, &b)?])
     }),
     ("cast_uint8", |g| {
         let x = x4(g)?;
@@ -230,61 +189,29 @@ const SPECIAL: &[(&str, Case)] = &[
         let x = x4(g)?;
         Ok(vec![g.cast(&x, DataType::Int32)?])
     }),
-    ("sum", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.sum(&x, &[-1, -2])?])
-    }),
-    ("mean", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.mean(&x, &[-1, -2])?])
-    }),
-    ("variance", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.variance(&x, &[-1])?])
-    }),
     ("layer_norm", |g| {
         let x = x4(g)?;
         let s = c(g, [4])?;
         let b = c(g, [4])?;
-        Ok(vec![g.layer_norm(&x, &[-1], &s, Some(&b), 1e-5)?])
+        Ok(vec![g.layer_norm(&x, &[-1], Some(&s), Some(&b), 1e-5)?])
     }),
-    ("layer_norm_no_bias", |g| {
+    ("layer_norm_plain", |g| {
         let x = x4(g)?;
-        let s = c(g, [4])?;
-        Ok(vec![g.layer_norm(&x, &[-1], &s, None, 1e-5)?])
-    }),
-    ("rms_norm", |g| {
-        let x = x4(g)?;
-        let s = c(g, [4])?;
-        Ok(vec![g.rms_norm(&x, &[-1], &s, 1e-5)?])
-    }),
-    ("group_norm", |g| {
-        let x = x4(g)?;
-        let s = c(g, [1, 2, 1, 1])?;
-        let b = c(g, [1, 2, 1, 1])?;
-        Ok(vec![g.group_norm(&x, 2, &s, Some(&b), 1e-5)?])
-    }),
-    ("batch_norm", |g| {
-        let x = x4(g)?;
-        let m = c(g, [1, 2, 1, 1])?;
-        let v = c(g, [1, 2, 1, 1])?;
-        let s = c(g, [1, 2, 1, 1])?;
-        let b = c(g, [1, 2, 1, 1])?;
-        Ok(vec![g.batch_norm(&x, &m, &v, &s, &b, 1e-5)?])
+        Ok(vec![g.layer_norm(&x, &[-1, -2], None, None, 1e-5)?])
     }),
     ("instance_norm", |g| {
         let x = x4(g)?;
-        let s = c(g, [1, 2, 1, 1])?;
-        let b = c(g, [1, 2, 1, 1])?;
-        Ok(vec![g.instance_norm(&x, &s, Some(&b), 1e-5)?])
+        let s = c(g, [2])?;
+        let b = c(g, [2])?;
+        Ok(vec![g.instance_norm(&x, Some(&s), Some(&b), 1e-5)?])
     }),
-    ("l2_normalize", |g| {
+    ("batch_norm", |g| {
         let x = x4(g)?;
-        Ok(vec![g.l2_normalize(&x, -1, 1e-5)?])
-    }),
-    ("local_response_norm", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.local_response_norm(&x, 3, 1e-4, 0.75, 1.0)?])
+        let m = c(g, [2])?;
+        let v = c(g, [2])?;
+        let s = c(g, [2])?;
+        let b = c(g, [2])?;
+        Ok(vec![g.batch_norm(&x, &m, &v, Some(&s), Some(&b), 1e-5)?])
     }),
     ("matmul", |g| {
         let a = h(g, [2, 3])?;
@@ -296,10 +223,11 @@ const SPECIAL: &[(&str, Case)] = &[
         let b = h(g, [4, 3])?;
         Ok(vec![g.matrix_multiplication(&a, &b, true, true)?])
     }),
-    ("quantized_matmul", |g| {
-        let a = typed(g, [2, 3], DataType::Int8)?;
-        let b = typed(g, [4, 3], DataType::Int8)?;
-        Ok(vec![g.quantized_matmul(&a, &b, 0.1, 0.2, true)?])
+    ("linear", |g| {
+        let x = h(g, [2, 4])?;
+        let w = c(g, [3, 4])?;
+        let b = c(g, [3])?;
+        Ok(vec![g.linear(&x, &w, Some(&b))?])
     }),
     ("attention", |g| {
         let q = h(g, [1, 2, 4, 8])?;
@@ -319,96 +247,25 @@ const SPECIAL: &[(&str, Case)] = &[
             Some(&m),
         )?])
     }),
-    ("rotary", |g| {
-        let x = h(g, [1, 2, 4, 8])?;
-        let cs = h(g, [4, 8])?;
-        let sn = h(g, [4, 8])?;
-        Ok(vec![g.rotary_embedding(&x, &cs, &sn, 8)?])
-    }),
-    ("einsum", |g| {
-        let a = h(g, [2, 3])?;
-        let b = h(g, [3, 4])?;
-        Ok(vec![g.einsum(&[&a, &b], "ij,jk->ik")?])
-    }),
-    ("einsum_batched", |g| {
-        let a = h(g, [2, 3, 5])?;
-        let b = h(g, [2, 5, 4])?;
-        Ok(vec![g.einsum(&[&a, &b], "bij,bjk->bik")?])
-    }),
-    ("pooling_2d", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.pooling_2d(
-            &x,
-            PoolType::Max,
-            &Pooling2dDescriptor::new([2, 2], [2, 2]),
-        )?])
-    }),
-    ("pooling_2d_average", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.pooling_2d(
-            &x,
-            PoolType::Average,
-            &Pooling2dDescriptor::new([3, 3], [1, 1]),
-        )?])
-    }),
-    ("l2_pool", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.pooling_2d(
-            &x,
-            PoolType::L2,
-            &Pooling2dDescriptor::new([2, 2], [2, 2]),
-        )?])
-    }),
     ("max_pool_same", |g| {
         let x = x4(g)?;
         let mut descriptor = Pooling2dDescriptor::new([2, 2], [2, 2]);
         descriptor.pad_mode = PadMode::Same;
-        Ok(vec![g.pooling_2d(&x, PoolType::Max, &descriptor)?])
-    }),
-    ("avg_pool", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.pooling_2d(
-            &x,
-            PoolType::Average,
-            &Pooling2dDescriptor::new([2, 2], [1, 1]),
-        )?])
-    }),
-    ("pad_constant", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.pad(&x, 1, 1, 1, 1, PadFillMode::Constant, 0.5)?])
-    }),
-    ("pad_reflect", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.pad(&x, 1, 1, 1, 1, PadFillMode::Reflect, 0.0)?])
-    }),
-    ("reshape", |g| {
-        let x = h(g, [2, 3])?;
-        Ok(vec![g.reshape(&x, [3, 2])?])
-    }),
-    ("transpose", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.transpose(&x, [0, 2, 1, 3])?])
-    }),
-    ("slice", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.slice(&x, [0, 0, 1, 1], [1, 2, 2, 2])?])
-    }),
-    ("strided_slice", |g| {
-        let x = h(g, [4, 8])?;
-        Ok(vec![g.strided_slice(&x, &[0, 0], &[2, 4], &[2, 2])?])
+        Ok(vec![g.max_pooling_2d(&x, &descriptor)?])
     }),
     ("concat", |g| {
         let a = h(g, [2, 3])?;
         let b = h(g, [2, 5])?;
-        Ok(vec![g.concat(&[&a, &b], 1)?])
+        Ok(vec![g.concat(&[&a, &b], 1, false)?])
+    }),
+    ("concat_interleave", |g| {
+        let a = h(g, [2, 3])?;
+        let b = h(g, [2, 3])?;
+        Ok(vec![g.concat(&[&a, &b], 1, true)?])
     }),
     ("split", |g| {
         let x = h(g, [2, 6])?;
         g.split(&x, &[2, 4], 1)
-    }),
-    ("flatten_2d", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.flatten_2d(&x, 2)?])
     }),
     ("expand_dims", |g| {
         let x = h(g, [2, 3])?;
@@ -418,123 +275,54 @@ const SPECIAL: &[(&str, Case)] = &[
         let x = h(g, [1, 2, 3])?;
         Ok(vec![g.squeeze(&x, &[0])?])
     }),
-    ("stack", |g| {
-        let a = h(g, [2, 3])?;
-        let b = h(g, [2, 3])?;
-        Ok(vec![g.stack(&[&a, &b], 0)?])
-    }),
-    ("tile", |g| {
-        let x = h(g, [2, 3])?;
-        Ok(vec![g.tile(&x, &[2, 1])?])
-    }),
-    ("broadcast_to", |g| {
-        let x = h(g, [1, 3])?;
-        Ok(vec![g.broadcast_to(&x, [2, 3])?])
-    }),
-    ("reverse", |g| {
-        let x = h(g, [2, 3])?;
-        Ok(vec![g.reverse(&x, &[1])?])
-    }),
     ("slice_update", |g| {
-        let x = h(g, [4, 4])?;
-        let u = h(g, [2, 2])?;
-        Ok(vec![g.slice_update(&x, &u, &[1, 1])?])
+        let x = x4(g)?;
+        let u = h(g, [1, 1, 4, 4])?;
+        Ok(vec![g.slice_update(&x, &u, &[0, 1, 0, 0])?])
+    }),
+    ("dynamic_slice", |g| {
+        let x = h(g, [1, 1, 8, 4])?;
+        let p = g.placeholder([1, 1, 1, 1], DataType::Int32)?;
+        Ok(vec![g.slice_dynamic(&x, &p, 2, 2)?])
     }),
     ("depth_to_space", |g| {
         let x = h(g, [1, 4, 2, 2])?;
         Ok(vec![g.depth_to_space(&x, 2)?])
     }),
-    ("space_to_depth", |g| {
-        let x = h(g, [1, 1, 4, 4])?;
-        Ok(vec![g.space_to_depth(&x, 2)?])
-    }),
     ("pixel_shuffle", |g| {
         let x = h(g, [1, 4, 2, 2])?;
         Ok(vec![g.pixel_shuffle(&x, 2)?])
-    }),
-    ("pixel_unshuffle", |g| {
-        let x = h(g, [1, 1, 4, 4])?;
-        Ok(vec![g.pixel_unshuffle(&x, 2)?])
-    }),
-    ("space_to_batch", |g| {
-        let x = h(g, [1, 1, 4, 4])?;
-        Ok(vec![g.space_to_batch(&x, [2, 2], [0, 0, 0, 0])?])
     }),
     ("batch_to_space", |g| {
         let x = h(g, [4, 1, 2, 2])?;
         Ok(vec![g.batch_to_space(&x, [2, 2], [0, 0, 0, 0])?])
     }),
-    ("crop", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.crop(&x, [1, 1, 1, 1])?])
-    }),
     ("gather", |g| {
         let x = h(g, [4, 8])?;
         let i = typed(g, [3], DataType::UInt16)?;
-        Ok(vec![g.gather(&x, &i, 0)?])
+        Ok(vec![g.gather(&x, &i, -1)?])
     }),
     ("gather_along_axis", |g| {
         let x = h(g, [4, 8])?;
         let i = typed(g, [4, 2], DataType::UInt16)?;
         Ok(vec![g.gather_along_axis(&x, &i, 1)?])
     }),
-    ("band_part", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.band_part(&x, -1, 0)?])
-    }),
-    ("one_hot", |g| {
-        let indices = typed(g, [3], DataType::UInt16)?;
-        Ok(vec![g.one_hot(&indices, 5)?])
-    }),
-    ("gather_nd", |g| {
-        let x = h(g, [4, 8])?;
-        let i = typed(g, [3, 2], DataType::UInt16)?;
-        Ok(vec![g.gather_nd(&x, &i)?])
-    }),
-    ("top_k", |g| {
+    ("topk", |g| {
         let x = h(g, [4, 8])?;
         let (v, i) = g.top_k(&x, 2, -1)?;
         Ok(vec![v, i])
     }),
-    ("bottom_k", |g| {
+    ("topk_ascending", |g| {
         let x = h(g, [4, 8])?;
         let (v, i) = g.bottom_k(&x, 3, 0)?;
         Ok(vec![v, i])
-    }),
-    ("sort", |g| {
-        let x = h(g, [4, 8])?;
-        Ok(vec![g.sort(&x, -1, true)?])
-    }),
-    ("argsort", |g| {
-        let x = h(g, [4, 8])?;
-        Ok(vec![g.argsort(&x, -1, false)?])
-    }),
-    ("cumulative_sum", |g| {
-        let x = h(g, [2, 5])?;
-        Ok(vec![g.cumulative_sum(&x, 1, false, false)?])
-    }),
-    ("cumulative_product", |g| {
-        let x = h(g, [2, 5])?;
-        Ok(vec![g.cumulative_product(&x, 1, true, false)?])
-    }),
-    ("cumulative_min", |g| {
-        let x = h(g, [2, 5])?;
-        Ok(vec![g.cumulative_min(&x, 1, false, true)?])
-    }),
-    ("cumulative_max", |g| {
-        let x = h(g, [2, 5])?;
-        Ok(vec![g.cumulative_max(&x, 1, true, true)?])
-    }),
-    ("reduce_product", |g| {
-        let x = h(g, [2, 5])?;
-        Ok(vec![g.reduction_product(&x, 1)?])
     }),
     ("quantize", |g| {
         let x = h(g, [2, 3])?;
         Ok(vec![g.quantize(&x, &[0.1], None, None, DataType::Int8)?])
     }),
     ("quantize_axis", |g| {
-        let x = h(g, [2, 3])?;
+        let x = h(g, [2, 3, 4])?;
         Ok(vec![g.quantize(
             &x,
             &[0.1, 0.2],
@@ -547,57 +335,44 @@ const SPECIAL: &[(&str, Case)] = &[
         let q = typed(g, [2, 3], DataType::Int8)?;
         Ok(vec![g.dequantize(&q, &[0.1], Some(&[1]), None)?])
     }),
-    ("quantize_int4", |g| {
+    ("constexpr_blockwise_shift_scale", |g| {
         let x = h(g, [2, 4])?;
-        Ok(vec![g.quantize_int4(&x, 0.1)?])
+        let w = g.blockwise_weights(&[1; 16], [4, 4], &int8_blocks())?;
+        Ok(vec![g.matrix_multiplication(&x, &w, false, false)?])
     }),
-    ("unpack_int4", |g| {
-        let b = typed(g, [2, 2], DataType::UInt8)?;
-        Ok(vec![g.unpack_int4(&b)?])
-    }),
-    ("unpack_signed_int4", |g| {
-        let b = typed(g, [2, 2], DataType::UInt8)?;
-        Ok(vec![g.unpack_signed_int4(&b)?])
-    }),
-    ("pack_signed_int4", |g| {
+    ("constexpr_lut_to_dense", |g| {
         let x = h(g, [2, 4])?;
-        Ok(vec![g.pack_signed_int4(&x)?])
-    }),
-    ("dequantize_groupwise", |g| {
-        let q = h(g, [2, 8])?;
-        let s = h(g, [2, 2])?;
-        Ok(vec![g.dequantize_groupwise(&q, &s, None, None, 4)?])
-    }),
-    ("blockwise_weights", |g| {
-        let x = h(g, [2, 4])?;
-        let w = g.blockwise_weights(
-            &[1; 16],
+        let w = g.palettized_weights(
+            &[0x1b; 4],
             [4, 4],
-            &BlockwiseQuantization::new(WeightDataType::Int8, &[0.1, 0.2, 0.3, 0.4], [4, 1]),
+            &Palettization::new(2, &[0.0, 0.5, 1.0, 1.5]),
         )?;
         Ok(vec![g.matrix_multiplication(&x, &w, false, false)?])
     }),
-    ("palettized_weights", |g| {
+    ("constexpr_lut_to_dense_grouped", |g| {
         let x = h(g, [2, 4])?;
-        let w = g.palettized_weights(&[0x1b; 4], 2, [4, 4], &[0.0, 0.5, 1.0, 1.5])?;
+        let palette: Vec<f32> = (0..8).map(|i| i as f32 * 0.25).collect();
+        let w = g.palettized_weights(
+            &[0x1b; 4],
+            [4, 4],
+            &Palettization {
+                group_shape: [2, 1],
+                ..Palettization::new(2, &palette)
+            },
+        )?;
         Ok(vec![g.matrix_multiplication(&x, &w, false, false)?])
     }),
-    ("sparse_weights", |g| {
+    ("constexpr_sparse_to_dense", |g| {
         let x = h(g, [2, 4])?;
         let w = g.sparse_weights(&[0x55, 0x55], [4, 4], &[1.0; 8])?;
         Ok(vec![g.matrix_multiplication(&x, &w, false, false)?])
     }),
-    ("sparse_blockwise_weights", |g| {
+    ("constexpr_sparse_blockwise_shift_scale", |g| {
         let x = h(g, [2, 4])?;
-        let w = g.sparse_blockwise_weights(
-            &[1; 8],
-            &[0x55, 0x55],
-            [4, 4],
-            &BlockwiseQuantization::new(WeightDataType::Int8, &[0.1, 0.2, 0.3, 0.4], [4, 1]),
-        )?;
+        let w = g.sparse_blockwise_weights(&[1; 8], &[0x55, 0x55], [4, 4], &int8_blocks())?;
         Ok(vec![g.matrix_multiplication(&x, &w, false, false)?])
     }),
-    ("sparse_palettized_weights", |g| {
+    ("constexpr_lut_to_sparse", |g| {
         let x = h(g, [2, 4])?;
         let w = g.sparse_palettized_weights(
             &[0x1b; 2],
@@ -608,53 +383,41 @@ const SPECIAL: &[(&str, Case)] = &[
         )?;
         Ok(vec![g.matrix_multiplication(&x, &w, false, false)?])
     }),
-    ("convolution_1x1", |g| {
-        let x = x4(g)?;
-        let w = c(g, [3, 2, 1, 1])?;
-        Ok(vec![g.convolution_2d_1x1(&x, &w, None)?])
-    }),
-    ("convolution", |g| {
+    ("conv", |g| {
         let x = x4(g)?;
         let w = c(g, [3, 2, 3, 3])?;
         let b = c(g, [3])?;
+        let descriptor = Convolution2dDescriptor {
+            pad_mode: PadMode::Same,
+            ..Default::default()
+        };
+        Ok(vec![g.convolution_2d(&x, &w, Some(&b), &descriptor)?])
+    }),
+    ("conv_runtime_weights", |g| {
+        let x = x4(g)?;
+        let w = h(g, [3, 2, 1, 1])?;
         Ok(vec![g.convolution_2d(
             &x,
             &w,
-            Some(&b),
-            &Convolution2dDescriptor {
-                pad_mode: PadMode::Same,
-                ..Default::default()
-            },
+            None,
+            &Convolution2dDescriptor::default(),
         )?])
     }),
-    ("convolution_transpose", |g| {
+    ("conv_transpose", |g| {
         let x = x4(g)?;
         let w = c(g, [2, 3, 3, 3])?;
+        let descriptor = ConvolutionTranspose2dDescriptor {
+            strides: [2, 2],
+            ..Default::default()
+        };
         Ok(vec![g.convolution_transpose_2d(
             &x,
             &w,
             None,
-            &ConvolutionTranspose2dDescriptor {
-                strides: [2, 2],
-                ..Default::default()
-            },
+            &descriptor,
         )?])
     }),
-    ("convolution_1x1_bias", |g| {
-        let x = h(g, [1, 2, 1, 1])?;
-        let w = c(g, [3, 2, 1, 1])?;
-        let b = c(g, [3])?;
-        Ok(vec![g.convolution_2d_1x1(&x, &w, Some(&b))?])
-    }),
-    ("resize", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.resize(&x, [8, 8], SamplingMode::Bilinear)?])
-    }),
-    ("upsample", |g| {
-        let x = x4(g)?;
-        Ok(vec![g.upsample(&x, [2, 2], SamplingMode::Nearest)?])
-    }),
-    ("sample_grid", |g| {
+    ("resample", |g| {
         let x = x4(g)?;
         let k = h(g, [1, 4, 4, 2])?;
         Ok(vec![g.sample_grid(
@@ -663,59 +426,18 @@ const SPECIAL: &[(&str, Case)] = &[
             &SamplingDescriptor::default(),
         )?])
     }),
-    ("affine", |g| {
-        let x = x4(g)?;
-        let m = h(g, [1, 6])?;
-        Ok(vec![g.affine(
-            &x,
-            &m,
-            [4, 4],
-            &SamplingDescriptor {
-                align_corners: true,
-                ..Default::default()
-            },
-        )?])
-    }),
-    ("crop_resize", |g| {
-        let x = x4(g)?;
-        let b = h(g, [1, 4])?;
-        let i = typed(g, [1], DataType::UInt16)?;
-        Ok(vec![g.crop_resize(&x, &b, &i, [2, 2], true)?])
-    }),
-    ("variable", |g| {
+    ("state", |g| {
         let x = h(g, [2, 3])?;
         let v = g.variable_with_data(&[0.5; 6], [2, 3])?;
         let r = g.read_variable(&v)?;
         Ok(vec![g.addition(&x, &r)?])
     }),
-    ("variable_from_surface", |g| {
+    ("state_from_surface", |g| {
         let x = h(g, [2, 3])?;
         let d = TensorData::with_type([2, 3], DataType::Float16)?;
         let v = g.variable_with_tensor_data(&d)?;
         let r = g.read_variable(&v)?;
         Ok(vec![g.addition(&x, &r)?])
-    }),
-    ("state_assign", |g| {
-        let x = h(g, [2, 3])?;
-        let s = g.variable_placeholder([2, 3])?;
-        let r = g.read_variable(&s)?;
-        let y = g.addition(&x, &r)?;
-        g.assign_variable(&s, &y)?;
-        Ok(vec![g.read_variable(&s)?])
-    }),
-    ("state_update_rows", |g| {
-        let x = h(g, [1, 1, 1, 4])?;
-        let p = g.placeholder([1, 1, 1, 1], DataType::Int32)?;
-        let s = g.variable_placeholder([1, 1, 8, 4])?;
-        g.assign_variable_rows(&s, &x, &p, 0)?;
-        Ok(vec![g.read_variable(&s)?])
-    }),
-    ("state_update_channel", |g| {
-        let x = h(g, [1, 1, 1, 4])?;
-        let p = g.placeholder([1, 1, 1, 1], DataType::Int32)?;
-        let s = g.variable_placeholder([1, 2, 8, 4])?;
-        g.assign_variable_rows(&s, &x, &p, 1)?;
-        Ok(vec![g.read_variable(&s)?])
     }),
     ("foreign_tensor", |g| {
         let x = x4(g)?;
@@ -725,49 +447,60 @@ const SPECIAL: &[(&str, Case)] = &[
     }),
 ];
 
+const CASES: [&[(&str, Case)]; 5] = [UNARY, BINARY, SCALAR, REDUCE, SPECIAL];
+const INVALID: [&str; 3] = ["foreign_tensor", "cast_int32", "conv_runtime_weights"];
+
 #[test]
-fn all_operations_lower_to_apple_mlir() {
-    for (name, case) in [UNARY, BINARY, SCALAR, AXIS, BOOLEAN, SPECIAL].concat() {
-        println!("lowering {name}");
+fn all_operations_emit_mil() {
+    let mut failures = Vec::new();
+    for (name, case) in CASES.concat() {
         let graph = Graph::new();
         let output = case(&graph);
-        if matches!(name, "foreign_tensor" | "cast_int32") {
+        if INVALID.contains(&name) {
             assert!(output.is_err());
             continue;
         }
-        let output = output.unwrap_or_else(|error| panic!("{name}: {error}"));
-        let program = graph
-            .program(&output, &[DataType::Float32])
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
-        let text = program
-            .mlir()
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert!(text.contains("func.func @main"), "{name}: {text}");
-        assert!(!text.contains("BLOBFILE"), "{name}: {text}");
+        let mil = output
+            .and_then(|output| graph.program(&output, &[DataType::Float32]))
+            .and_then(|program| Ok(program.mil()?));
+        match mil {
+            Ok(mil) => assert!(mil.text.contains("func main<ios18>("), "{name}"),
+            Err(error) => failures.push(format!("{name}: {error}")),
+        }
     }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[test]
 fn invalid_parameter_does_not_change_the_graph() {
     let graph = Graph::new();
     let input = h(&graph, [2, 64]).unwrap();
-    for value in [f64::MAX, 65536.0, -65536.0] {
+    for value in [f32::MAX, 65536.0, -65536.0] {
         assert!(matches!(
-            graph.threshold(&input, value),
+            graph.leaky_relu(&input, value),
             Err(GraphError::Ir(ane::IrError::InvalidValue("fp16")))
         ));
         assert!(matches!(
             graph.linear_activation(&input, value, 0.0),
-            Err(GraphError::Ir(ane::IrError::InvalidValue("fp32")))
+            Err(GraphError::Ir(ane::IrError::InvalidValue("fp16")))
         ));
     }
     let output = graph.relu(&input).unwrap();
-    let actual = graph.program(&[output], &[DataType::Float16]).unwrap();
+    let actual = graph
+        .program(&[output], &[DataType::Float16])
+        .unwrap()
+        .mil()
+        .unwrap();
     let clean = Graph::new();
     let input = h(&clean, [2, 64]).unwrap();
     let output = clean.relu(&input).unwrap();
-    let expected = clean.program(&[output], &[DataType::Float16]).unwrap();
-    assert!(actual == expected);
+    let expected = clean
+        .program(&[output], &[DataType::Float16])
+        .unwrap()
+        .mil()
+        .unwrap();
+    assert_eq!(actual.text, expected.text);
+    assert_eq!(actual.weights, expected.weights);
 }
 
 #[test]
@@ -799,30 +532,24 @@ fn boolean_gather_data_is_rejected() {
 #[test]
 fn all_operations_compile_for_ane() {
     let expected = [
-        ("fill_like", "the output does not depend on a live input"),
         ("integer_parameter", "Int32 is only a state position type"),
         (
-            "boolean_constant",
-            "Apple folds the unused select branch input",
-        ),
-        (
-            "variable_from_surface",
+            "state_from_surface",
             "the bound surface uses an unpadded layout",
         ),
     ];
     let mut failures = Vec::new();
-    for (name, case) in [UNARY, BINARY, SCALAR, AXIS, BOOLEAN, SPECIAL].concat() {
-        if matches!(name, "foreign_tensor" | "cast_int32") {
+    for (name, case) in CASES.concat() {
+        if INVALID.contains(&name) {
             continue;
         }
         let graph = Graph::new();
-        let output = case(&graph).unwrap();
-        if let Err(error) = graph.compile(&output, &[], None) {
+        let compiled = case(&graph)
+            .map_err(ane::Error::from)
+            .and_then(|outputs| graph.compile(&outputs, &[], None));
+        if let Err(error) = compiled {
+            println!("{name}: {error}");
             failures.push(name);
-            assert!(
-                expected.iter().any(|(case, _)| *case == name),
-                "{name}: {error}"
-            );
         }
     }
     assert_eq!(failures, expected.map(|(name, _)| name));
@@ -836,4 +563,22 @@ fn constants_must_fit_fp16_unless_explicitly_infinite() {
         Err(GraphError::Ir(ane::IrError::InvalidValue("fp16")))
     ));
     assert!(graph.constant(&[f32::NEG_INFINITY, 65_504.0], [2]).is_ok());
+}
+
+#[test]
+fn programs_write_at_most_seven_variables() -> Result<(), ane::Error> {
+    let graph = Graph::new();
+    let x = h(&graph, [1, 1, 1, 64])?;
+    let position = graph.placeholder([1], DataType::Int32)?;
+    let mut writes = Vec::new();
+    for _ in 0..8 {
+        let variable = graph.variable_with_data(&[0.; 64], [1, 1, 1, 64])?;
+        writes.push(graph.assign_variable_rows(&variable, &x, &position, 0)?);
+    }
+    let writes: Vec<_> = writes.iter().collect();
+    assert!(matches!(
+        graph.compile(&[x], &writes, None),
+        Err(ane::Error::Graph(GraphError::UnsupportedComposition(_)))
+    ));
+    Ok(())
 }

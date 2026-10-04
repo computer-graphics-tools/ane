@@ -21,6 +21,7 @@ impl ANERequest {
         input_indices: &[u32],
         outputs: &[&IOSurface],
         output_indices: &[u32],
+        procedure: u32,
     ) -> Result<Retained<Self>, AneError> {
         ensure_model_interfaces()?;
         let surfaces = |surfaces: &[&IOSurface]| {
@@ -43,7 +44,7 @@ impl ANERequest {
         let outputs = surfaces(outputs)?;
         let input_indices = indices(input_indices);
         let output_indices = indices(output_indices);
-        let procedure = NSNumber::new_u32(0);
+        let procedure = NSNumber::new_u32(procedure);
         unsafe {
             Retained::retain_autoreleased(raw_message!(Self::class(),
                 c"requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:sharedEvents:",

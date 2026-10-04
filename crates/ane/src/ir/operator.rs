@@ -1,3 +1,5 @@
+use std::fmt::{self, Display, Formatter};
+
 use crate::ir::{ArgumentType, Parameter};
 
 macro_rules! operators {
@@ -24,6 +26,7 @@ operators! {
         Exp2 => "exp2",
         Floor => "floor",
         Relu => "relu",
+        Relu6 => "relu6",
         Round => "round",
         Sigmoid => "sigmoid",
         Sign => "sign",
@@ -32,6 +35,7 @@ operators! {
         Softplus => "softplus",
         Softsign => "softsign",
         Sqrt => "sqrt",
+        Square => "square",
         Tanh => "tanh",
     ] (
         X: FloatTensor
@@ -60,8 +64,7 @@ operators! {
         X: Tensor,
         Y: Tensor
     );
-    [LogicalNot => "logical_not"] (X: BoolTensor);
-    [LogicalAnd => "logical_and", LogicalOr => "logical_or"] (X: BoolTensor, Y: BoolTensor);
+    [LogicalAnd => "logical_and"] (X: BoolTensor, Y: BoolTensor);
     [Select => "select"] (Cond: BoolTensor, A: Tensor, B: Tensor);
     [Matmul => "matmul"] (X: FloatTensor, Y: FloatTensor, TransposeX: Bool, TransposeY: Bool);
     [ScaledDotProductAttention => "scaled_dot_product_attention"] (
@@ -70,9 +73,33 @@ operators! {
         Value: FloatTensor;
         AttnMask: FloatTensor
     );
-    [LeakyRelu => "leaky_relu", Elu => "elu"] (X: FloatTensor, Alpha: Fp32);
-    [LinearActivation => "linear_activation"] (X: FloatTensor, Alpha: Fp32, Beta: Fp32);
-    [Threshold => "threshold", ThresholdedRelu => "thresholded_relu"] (X: FloatTensor, Alpha: Fp16);
+    [LeakyRelu => "leaky_relu", Elu => "elu"] (X: FloatTensor, Alpha: Fp16);
+    [
+        LinearActivation => "linear_activation",
+        SigmoidHard => "sigmoid_hard",
+        ScaledTanh => "scaled_tanh",
+        ClampedRelu => "clamped_relu",
+        Clip => "clip",
+    ] (
+        X: FloatTensor,
+        Alpha: Fp16,
+        Beta: Fp16
+    );
+    [Prelu => "prelu"] (X: FloatTensor, Alpha: FloatBlob);
+    [SoftplusParametric => "softplus_parametric"] (X: FloatTensor, Alpha: FloatBlob, Beta: FloatBlob);
+    [Linear => "linear"] (X: FloatTensor, Weight: FloatBlob; Bias: FloatBlob);
+    [LayerNorm => "layer_norm"] (X: FloatTensor, Axes: Int32List, Epsilon: Fp16; Gamma: FloatBlob, Beta: FloatBlob);
+    [InstanceNorm => "instance_norm"] (X: FloatTensor, Epsilon: Fp16; Gamma: FloatBlob, Beta: FloatBlob);
+    [BatchNorm => "batch_norm"] (
+        X: FloatTensor,
+        Mean: FloatBlob,
+        Variance: FloatBlob,
+        Epsilon: Fp16;
+        Gamma: FloatBlob,
+        Beta: FloatBlob
+    );
+    [L2Norm => "l2_norm"] (X: FloatTensor, Epsilon: Fp16);
+    [ThresholdedRelu => "thresholded_relu"] (X: FloatTensor, Alpha: Fp16);
     [Gelu => "gelu"] (X: FloatTensor, Mode: String);
     [Softmax => "softmax"] (X: FloatTensor, Axis: Int32);
     [LocalResponseNorm => "local_response_norm"] (
@@ -87,10 +114,21 @@ operators! {
         ReduceMean => "reduce_mean",
         ReduceMin => "reduce_min",
         ReduceMax => "reduce_max",
+        ReduceL1Norm => "reduce_l1_norm",
+        ReduceL2Norm => "reduce_l2_norm",
+        ReduceLogSum => "reduce_log_sum",
+        ReduceLogSumExp => "reduce_log_sum_exp",
+        ReduceSumSquare => "reduce_sum_square",
     ] (
         X: FloatTensor,
         Axes: Int32List,
         KeepDims: Bool
+    );
+    [ReduceArgmax => "reduce_argmax", ReduceArgmin => "reduce_argmin"] (
+        X: FloatTensor,
+        Axis: Int32,
+        KeepDims: Bool,
+        OutputDtype: String
     );
     [Reshape => "reshape"] (X: Tensor, Shape: Int32List);
     [Transpose => "transpose"] (X: Tensor, Perm: Int32List);
@@ -106,13 +144,16 @@ operators! {
         EndMask: BoolList,
         SqueezeMask: BoolList
     );
+    [SliceUpdate => "slice_update"] (X: Tensor, Update: Tensor, Begin: Int32List, End: Int32List);
+    [Split => "split"] (X: Tensor, SplitSizes: Int32List, Axis: Int32);
+    [Stack => "stack"] (Values: Tensor, Axis: Int32);
     [Concat => "concat"] (Values: Tensor, Axis: Int32, Interleave: Bool);
     [Tile => "tile"] (X: Tensor, Reps: Int32List);
     [Reverse => "reverse"] (X: Tensor, Axes: Int32List);
     [Pad => "pad"] (X: FloatTensor, Pad: Int32List, Mode: String, ConstantVal: Fp16);
     [DepthToSpace => "depth_to_space", SpaceToDepth => "space_to_depth"] (X: FloatTensor, BlockSize: Int32);
     [PixelShuffle => "pixel_shuffle"] (X: FloatTensor, UpscaleFactor: Int32);
-    [PixelUnshuffle => "pixel_unshuffle"] (X: FloatTensor, DownscaleFactor: Int32);
+    [SpaceToBatch => "space_to_batch"] (X: FloatTensor, BlockShape: Int32List, Paddings: Int32Matrix);
     [BatchToSpace => "batch_to_space"] (X: FloatTensor, BlockShape: Int32List, Crops: Int32Matrix);
     [Conv => "conv"] (
         X: FloatTensor,
@@ -174,7 +215,6 @@ operators! {
         Axis: Int32,
         ValidateIndices: Bool
     );
-    [GatherNd => "gather_nd"] (X: Tensor, Indices: IndexTensor, BatchDims: Int32, ValidateIndices: Bool);
     [ResizeNearestNeighbor => "resize_nearest_neighbor"] (
         X: FloatTensor,
         TargetSizeHeight: Int32,
@@ -195,17 +235,6 @@ operators! {
         CoordinatesMode: String,
         AlignCorners: Bool
     );
-    [Affine => "affine"] (
-        X: FloatTensor,
-        TransformMatrix: FloatTensor,
-        SamplingMode: String,
-        PaddingMode: String,
-        PaddingValue: Fp16,
-        CoordinatesMode: String,
-        AlignCorners: Bool,
-        OutputHeight: Int32,
-        OutputWidth: Int32
-    );
     [Quantize => "quantize"] (
         Input: FloatTensor,
         Scale: Scale,
@@ -217,17 +246,23 @@ operators! {
     [ConstexprBlockwiseShiftScale => "constexpr_blockwise_shift_scale"] (
         Data: Blob,
         Scale: FloatBlob;
-        Offset: FloatBlob
+        Offset: Blob
     );
-    [ConstexprLutToDense => "constexpr_lut_to_dense"] (Indices: Blob, Lut: FloatBlob);
+    [ConstexprLutToDense => "constexpr_lut_to_dense"] (
+        Indices: Blob,
+        Lut: Blob;
+        LutScale: FloatBlob,
+        LutOffset: Blob,
+        VectorAxis: Int32
+    );
     [ConstexprSparseToDense => "constexpr_sparse_to_dense"] (Mask: MaskBlob, NonzeroData: FloatBlob);
-    [SparseBlockwiseWeights => "sparse_blockwise_weights"] (
+    [ConstexprSparseBlockwiseShiftScale => "constexpr_sparse_blockwise_shift_scale"] (
         DataMask: MaskBlob,
         NonzeroData: Blob,
         Scale: FloatBlob;
-        Offset: FloatBlob
+        Offset: Blob
     );
-    [SparsePaletteWeights => "sparse_palette_weights"] (
+    [ConstexprLutToSparse => "constexpr_lut_to_sparse"] (
         IndicesMask: MaskBlob,
         IndicesNonzeroData: Blob,
         Lut: FloatBlob
@@ -241,14 +276,14 @@ impl Operator {
             Self::ConstexprBlockwiseShiftScale
                 | Self::ConstexprLutToDense
                 | Self::ConstexprSparseToDense
-                | Self::SparseBlockwiseWeights
-                | Self::SparsePaletteWeights
+                | Self::ConstexprSparseBlockwiseShiftScale
+                | Self::ConstexprLutToSparse
         )
     }
 }
 
-impl std::fmt::Display for Operator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for Operator {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }

@@ -5,24 +5,36 @@ use objc2_foundation::{NSBundle, NSString};
 
 use crate::UnavailableInterface;
 use crate::apple_neural_engine::AneError;
-use crate::unavailable_interface::ensure_interfaces;
+use crate::ensure_interfaces;
 
 pub fn ensure_model_interfaces() -> Result<(), AneError> {
     static AVAILABILITY: OnceLock<Result<(), AneError>> = OnceLock::new();
     ensure(&AVAILABILITY, || {
         ensure_interfaces(&[
+            (obfcstr!(c"_ANEModel"), &[], &[obfcstr!(c"modelAttributes")]),
             (
-                obfcstr!(c"_ANEModel"),
-                &[obfcstr!(c"modelAtURL:key:")],
-                &[obfcstr!(c"modelAttributes")],
+                obfcstr!(c"_ANEInMemoryModelDescriptor"),
+                &[obfcstr!(c"modelWithMILText:weights:optionsPlist:")],
+                &[],
+            ),
+            (
+                obfcstr!(c"_ANEInMemoryModel"),
+                &[obfcstr!(c"inMemoryModelWithDescriptor:")],
+                &[
+                    obfcstr!(c"hexStringIdentifier"),
+                    obfcstr!(c"compiledModelExists"),
+                    obfcstr!(c"compileWithQoS:options:error:"),
+                    obfcstr!(c"loadWithQoS:options:error:"),
+                    obfcstr!(c"unloadWithQoS:error:"),
+                    obfcstr!(c"purgeCompiledModel"),
+                    obfcstr!(c"model"),
+                ],
             ),
             (
                 obfcstr!(c"_ANEClient"),
                 &[obfcstr!(c"sharedConnection")],
                 &[
-                    obfcstr!(c"loadModel:options:qos:error:"),
                     obfcstr!(c"evaluateWithModel:options:request:qos:error:"),
-                    obfcstr!(c"unloadModel:options:qos:error:"),
                     obfcstr!(c"mapIOSurfacesWithModel:request:cacheInference:error:"),
                     obfcstr!(c"unmapIOSurfacesWithModel:request:"),
                 ],

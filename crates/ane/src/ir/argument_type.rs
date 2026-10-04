@@ -15,7 +15,6 @@ pub enum ArgumentType {
     Int32Matrix,
     BoolList,
     Fp16,
-    Fp32,
     String,
     Scale,
     ZeroPoint,
@@ -44,7 +43,6 @@ impl ArgumentType {
                 | (Self::Int32List, Value::Int32List(_))
                 | (Self::Int32Matrix, Value::Int32Matrix(_))
                 | (Self::BoolList, Value::BoolList(_))
-                | (Self::Fp32, Value::Fp32(_))
                 | (Self::String, Value::String(_))
                 | (Self::Scale, Value::Fp16(_) | Value::Fp16List(_))
                 | (

@@ -4,16 +4,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::graph::{Tensor, TensorHandle};
-use crate::{DataType, VariableData};
+use crate::{DataType, StateData};
 
 pub struct GraphState {
     pub inputs: Vec<(Tensor, DataType)>,
-    pub constants: HashMap<usize, (WeightBlob, [usize; 4])>,
+    pub constants: HashMap<usize, WeightBlob>,
     pub ops: Vec<(Op, Tensor)>,
     pub tensors: Vec<Tensor>,
     pub identity: u64,
-    pub state_versions: HashMap<usize, Tensor>,
-    pub variables: HashMap<Tensor, VariableData>,
+    pub states: HashMap<Tensor, StateData>,
 }
 
 impl Default for GraphState {
@@ -27,8 +26,7 @@ impl Default for GraphState {
             identity: NEXT
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .expect("graph identity space exhausted"),
-            state_versions: HashMap::new(),
-            variables: HashMap::new(),
+            states: HashMap::new(),
         }
     }
 }
@@ -68,7 +66,6 @@ impl GraphState {
             .collect();
         let op = BuiltinOp {
             operation,
-            logical: false,
             blobs,
             inputs: inputs.into(),
             attributes: attributes.into(),
@@ -77,20 +74,6 @@ impl GraphState {
         op.validate()?;
         self.tensors.extend_from_slice(&outputs);
         self.ops.push((Op::Builtin(op), outputs[0]));
-        Ok(outputs)
-    }
-
-    pub fn logical_builtin(
-        &mut self,
-        operation: Operator,
-        inputs: &[(Parameter, Tensor)],
-        attributes: &[(Parameter, Value)],
-        shapes: &[(DataType, &[usize])],
-    ) -> Result<Vec<Tensor>, GraphError> {
-        let outputs = self.builtin_many(operation, inputs, attributes, shapes, Box::new([]))?;
-        if let Some((Op::Builtin(op), _)) = self.ops.last_mut() {
-            op.logical = true;
-        }
         Ok(outputs)
     }
 
@@ -123,6 +106,14 @@ impl GraphState {
         let tensor = Tensor::new(self.tensors.len(), self.identity, shape, rank, dtype);
         self.tensors.push(tensor);
         tensor
+    }
+
+    pub fn is_constant(&self, tensor: Tensor) -> bool {
+        self.constants.contains_key(&tensor.id())
+            || self.ops.iter().any(|(op, _)| {
+                matches!(op, Op::Builtin(op) if op.outputs.contains(&tensor)
+                    && op.inputs.iter().all(|&(_, input)| self.is_constant(input)))
+            })
     }
 
     pub fn check_tensor(&self, tensor: Tensor) -> Result<(), GraphError> {

@@ -1,8 +1,6 @@
-use crate::CoordinateMode;
 use crate::DataType;
 use crate::PadFillMode;
 use crate::SamplingDescriptor;
-use crate::SamplingMode;
 use crate::graph::Graph;
 use crate::graph::GraphBuilder;
 use crate::graph::Tensor;
@@ -45,6 +43,7 @@ impl Graph {
         ])
     }
 
+    /// Samples `input` at `[N, H, W, 2]` coordinates as the descriptor configures. MIL `resample`.
     pub fn sample_grid(
         &self,
         input: &Tensor,
@@ -78,54 +77,5 @@ impl Graph {
             &shape,
             DataType::Float16,
         )
-    }
-
-    pub fn affine(
-        &self,
-        input: &Tensor,
-        matrix: &Tensor,
-        size: [usize; 2],
-        descriptor: &SamplingDescriptor,
-    ) -> Result<Tensor, GraphError> {
-        self.numeric(*input)?;
-        self.numeric(*matrix)?;
-        ensure(
-            input.rank() == 4
-                && matrix.rank() == 2
-                && matrix.physical_shape()[3] == 6
-                && (matrix.physical_shape()[2] == 1
-                    || matrix.physical_shape()[2] == input.physical_shape()[0]),
-            GraphError::ShapeMismatch("affine requires NCHW input and [batch or 1,6] transforms"),
-        )?;
-        ensure(
-            descriptor.mode == SamplingMode::Bilinear
-                && descriptor.padding == PadFillMode::Constant
-                && descriptor.padding_value == 0.0
-                && descriptor.coordinates == CoordinateMode::MinusOneToOne
-                && descriptor.align_corners,
-            GraphError::InvalidArgument(
-                "ANE affine requires bilinear sampling, zero padding, [-1,1] coordinates and aligned corners",
-            ),
-        )?;
-        let mut attrs = Self::sampling_attributes(descriptor)?;
-        attrs.push((Parameter::OutputHeight, Value::Int32(size[0])));
-        attrs.push((Parameter::OutputWidth, Value::Int32(size[1])));
-        Ok(self.logical_builtin(
-            Operator::Affine,
-            &[
-                (Parameter::X, *input),
-                (Parameter::TransformMatrix, *matrix),
-            ],
-            &attrs,
-            &[(
-                DataType::Float16,
-                &[
-                    input.physical_shape()[0],
-                    input.physical_shape()[1],
-                    size[0],
-                    size[1],
-                ],
-            )],
-        )?[0])
     }
 }

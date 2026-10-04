@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::Error;
-use crate::request::Request;
+use crate::{Error, Request};
 
+/// Mapped requests of one executable, keyed by the IOSurface IDs the caller bound.
 #[derive(Default)]
 pub struct RequestCache {
     requests: Mutex<VecDeque<Arc<Request>>>,
@@ -15,7 +15,7 @@ impl RequestCache {
     pub fn get_or_insert(
         &self,
         bindings: &[u32],
-        create: impl FnOnce() -> Result<Request, Error>,
+        create: impl FnOnce() -> Result<Arc<Request>, Error>,
     ) -> Result<Arc<Request>, Error> {
         let mut requests = self.requests.lock().map_err(|_| Error::Synchronization)?;
         if let Some(index) = requests.iter().position(|r| r.bindings() == bindings) {
@@ -23,7 +23,7 @@ impl RequestCache {
             requests.push_back(request.clone());
             return Ok(request);
         }
-        let request = Arc::new(create()?);
+        let request = create()?;
         if requests.len() == Self::CAPACITY {
             requests.pop_front();
         }

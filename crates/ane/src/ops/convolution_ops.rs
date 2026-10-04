@@ -6,90 +6,62 @@ use crate::graph::GraphBuilder;
 use crate::graph::Tensor;
 use crate::graph::TensorHandle;
 use crate::graph::{GraphError, ensure};
-use crate::ir::{Op, Operator, Parameter, Value};
+use crate::ir::{Operator, Parameter, Value};
 
 impl Graph {
-    pub fn convolution_2d_1x1(
-        &self,
-        input: &Tensor,
-        weights: &Tensor,
-        bias: Option<&Tensor>,
-    ) -> Result<Tensor, GraphError> {
-        self.numeric(*input)?;
-        self.numeric(*weights)?;
-        ensure(
-            weights.physical_shape()[2..] == [1, 1],
-            GraphError::ShapeMismatch("1x1 convolution requires a 1x1 kernel"),
-        )?;
-        let constant = {
-            let state = self.state();
-            state.constants.contains_key(&weights.id())
-                || state.ops.iter().any(|(op, t)| {
-                    *t == *weights && matches!(op, Op::Builtin(op) if op.operation.is_constant())
-                })
-        };
-        if !constant {
-            let shape = Convolution2dDescriptor::default()
-                .output_shape(input.physical_shape(), weights.physical_shape())?;
-            let count = shape[0]
-                .checked_mul(shape[2])
-                .and_then(|n| n.checked_mul(shape[3]))
-                .ok_or(GraphError::Overflow)?;
-            let input = self.reshape_to(*input, &input.physical_shape())?;
-            let input = self.transpose(&input, [0, 2, 3, 1])?;
-            let input = self.reshape(&input, [count, weights.physical_shape()[1]])?;
-            let weights = self.reshape(weights, [shape[1], weights.physical_shape()[1]])?;
-            let output = self.matrix_multiplication(&input, &weights, false, true)?;
-            let output = self.reshape(&output, [shape[0], shape[2], shape[3], shape[1]])?;
-            let output = self.transpose(&output, [0, 3, 1, 2])?;
-            let Some(bias) = bias else {
-                return Ok(output);
-            };
-            self.check_tensor(*bias)?;
-            ensure(
-                bias.physical_shape().iter().product::<usize>() == shape[1],
-                GraphError::ShapeMismatch("convolution bias count differs"),
-            )?;
-            let bias = self.reshape(bias, [1, shape[1], 1, 1])?;
-            return self.addition(&output, &bias);
-        }
-        self.convolution_2d(input, weights, bias, &Convolution2dDescriptor::default())
-    }
-
+    /// 2-D convolution with constant weights `[Cout, Cin / groups, kH, kW]` and an optional constant
+    /// bias `[Cout]`. Runtime weights are rejected because the ANE returns wrong results for them.
+    /// MIL `conv`.
     pub fn convolution_2d(
         &self,
-        input: &Tensor,
-        weights: &Tensor,
+        x: &Tensor,
+        weight: &Tensor,
         bias: Option<&Tensor>,
         descriptor: &Convolution2dDescriptor,
     ) -> Result<Tensor, GraphError> {
-        self.numeric(*input)?;
-        self.numeric(*weights)?;
-        let shape = descriptor.output_shape(input.physical_shape(), weights.physical_shape())?;
-        let padding = if descriptor.pad_mode == PadMode::Same {
-            "same_lower"
-        } else if descriptor.padding == [0; 4] {
-            "valid"
-        } else {
-            "custom"
-        };
-        let attrs = [
-            (Parameter::Strides, Value::int32_list(&descriptor.strides)),
-            (
-                Parameter::Dilations,
-                Value::int32_list(&descriptor.dilations),
+        self.numeric(*x)?;
+        self.numeric(*weight)?;
+        ensure(
+            self.state().is_constant(*weight),
+            GraphError::NonConstantWeights(
+                "ANE convolution weights must be compile-time constants",
             ),
-            (Parameter::Groups, Value::Int32(descriptor.groups)),
-            (Parameter::Pad, Value::int32_list(&descriptor.padding)),
-            (Parameter::PadType, Value::String(padding)),
-        ];
-        let output = self.builtin(
+        )?;
+        let shape = descriptor.output_shape(x.physical_shape(), weight.physical_shape())?;
+        let constants = bias
+            .map(|bias| self.constant_input(*bias, Parameter::Bias, &[shape[1]]))
+            .transpose()?
+            .into_iter()
+            .collect();
+        self.builtin_with_constants(
             Operator::Conv,
-            &[(Parameter::X, *input), (Parameter::Weight, *weights)],
-            &attrs,
+            &[(Parameter::X, *x), (Parameter::Weight, *weight)],
+            &[
+                (Parameter::Strides, Value::int32_list(&descriptor.strides)),
+                (
+                    Parameter::Dilations,
+                    Value::int32_list(&descriptor.dilations),
+                ),
+                (Parameter::Groups, Value::Int32(descriptor.groups)),
+                (Parameter::Pad, Value::int32_list(&descriptor.padding)),
+                (
+                    Parameter::PadType,
+                    Value::String(pad_type(descriptor.pad_mode, descriptor.padding)),
+                ),
+            ],
+            constants,
             &shape,
             DataType::Float16,
-        )?;
-        self.convolution_bias(output, bias.copied(), shape[1])
+        )
+    }
+}
+
+pub fn pad_type(mode: PadMode, padding: [usize; 4]) -> &'static str {
+    if mode == PadMode::Same {
+        "same"
+    } else if padding == [0; 4] {
+        "valid"
+    } else {
+        "custom"
     }
 }

@@ -1,18 +1,21 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
-use crate::completion::Completion;
-use crate::{Error, TensorData};
+use crate::{Error, Outcome, TensorData};
 
 pub struct Submission {
-    state: Arc<Completion>,
+    outcome: Arc<Outcome>,
     results: Box<[TensorData]>,
     consumed: bool,
 }
 
 impl Submission {
-    pub fn new(state: Arc<Completion>, results: Box<[TensorData]>) -> Self {
+    pub fn new(outcome: Arc<Outcome>, results: Box<[TensorData]>) -> Self {
         Self {
-            state,
+            outcome,
             results,
             consumed: false,
         }
@@ -23,69 +26,35 @@ impl Submission {
     }
 
     pub fn is_finished(&self) -> bool {
-        self.consumed
-            || self
-                .state
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .result
-                .is_some()
+        self.consumed || self.outcome.is_finished()
     }
 
     pub fn wait(mut self) -> Result<Box<[TensorData]>, Error> {
         if !self.consumed {
             self.consumed = true;
-            self.state.wait()?;
+            self.outcome.wait()?;
         }
         Ok(std::mem::take(&mut self.results))
     }
 
-    pub fn wait_timeout(&mut self, timeout: std::time::Duration) -> Result<bool, Error> {
-        if self.consumed {
-            return Ok(true);
-        }
-        let (mut state, _) = self
-            .state
-            .done
-            .wait_timeout_while(
-                self.state
-                    .state
-                    .lock()
-                    .map_err(|_| Error::Synchronization)?,
-                timeout,
-                |state| state.result.is_none(),
-            )
-            .map_err(|_| Error::Synchronization)?;
-        let Some(result) = state.result.take() else {
-            return Ok(false);
-        };
-        self.consumed = true;
-        result.map(|()| true)
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        self.consumed || self.outcome.wait_timeout(timeout)
     }
 }
 
-impl std::future::Future for Submission {
+impl Future for Submission {
     type Output = Result<Box<[TensorData]>, Error>;
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if !this.consumed {
-            let mut state = this.state.state.lock().unwrap_or_else(|e| e.into_inner());
-            match state.result.take() {
-                Some(Err(error)) => {
+            match this.outcome.poll(context.waker()) {
+                None => return Poll::Pending,
+                Some(result) => {
                     this.consumed = true;
-                    return std::task::Poll::Ready(Err(error));
-                }
-                Some(Ok(())) => this.consumed = true,
-                None => {
-                    state.waker = Some(context.waker().clone());
-                    return std::task::Poll::Pending;
+                    result?;
                 }
             }
         }
-        std::task::Poll::Ready(Ok(std::mem::take(&mut this.results)))
+        Poll::Ready(Ok(std::mem::take(&mut this.results)))
     }
 }

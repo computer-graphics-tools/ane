@@ -6,9 +6,11 @@ use crate::graph::TensorHandle;
 use crate::graph::{GraphError, checked_shape, ensure};
 use crate::graph::{Operation, state_operation};
 use crate::ir::{Op, StateReadOp, StateUpdateOp, StateWriteOp, WeightBlob};
-use crate::{TensorData, VariableData, WeightDataType, logical_shape};
+use crate::{StateData, TensorData, WeightDataType, logical_shape};
 
 impl Graph {
+    /// A runtime input with up to four axes. Float32 and Float16 inputs compute in Float16; Int32 is
+    /// only accepted as a scalar position.
     pub fn placeholder<const RANK: usize>(
         &self,
         shape: [usize; RANK],
@@ -17,6 +19,8 @@ impl Graph {
         self.input_placeholder(logical_shape(&shape), data_type)
     }
 
+    /// A Float16 variable initialised from `data`. Its storage persists across runs and is shared by
+    /// executables compiled together.
     pub fn variable_with_data<const RANK: usize>(
         &self,
         data: &[f32],
@@ -24,30 +28,33 @@ impl Graph {
     ) -> Result<Tensor, GraphError> {
         ensure(
             data.len() == checked_shape(&shape)?.iter().product::<usize>(),
-            GraphError::ShapeMismatch("variable data length differs from shape"),
+            GraphError::ShapeMismatch("input data length differs from shape"),
         )?;
-        let variable = self.variable_placeholder(shape)?;
+        let input = self.variable_placeholder(shape)?;
         self.state()
-            .variables
-            .insert(variable, VariableData::Values(data.into()));
-        Ok(variable)
+            .states
+            .insert(input, StateData::Values(data.into()));
+        Ok(input)
     }
 
+    /// A variable stored in the caller's IOSurface-backed `data` (Float16, Int8 or UInt8), which the
+    /// CPU can read and rewrite between runs.
     pub fn variable_with_tensor_data(&self, data: &TensorData) -> Result<Tensor, GraphError> {
         ensure(
             matches!(
                 data.data_type(),
                 DataType::Float16 | DataType::Int8 | DataType::UInt8
             ),
-            GraphError::UnsupportedDataType("ANE variables require Float16, Int8 or UInt8 storage"),
+            GraphError::UnsupportedDataType("ANE states require Float16, Int8 or UInt8 storage"),
         )?;
-        let variable = self.input_placeholder(data.shape(), data.data_type())?;
+        let input = self.input_placeholder(data.shape(), data.data_type())?;
         self.state()
-            .variables
-            .insert(variable, VariableData::Surface(data.clone()));
-        Ok(variable)
+            .states
+            .insert(input, StateData::Surface(data.clone()));
+        Ok(input)
     }
 
+    /// A Float16 variable whose storage the caller passes as an input on every run.
     pub fn variable_placeholder<const RANK: usize>(
         &self,
         shape: [usize; RANK],
@@ -55,76 +62,70 @@ impl Graph {
         self.placeholder(shape, DataType::Float16)
     }
 
-    pub fn read_variable(&self, variable: &Tensor) -> Result<Tensor, GraphError> {
-        self.ensure_variable(*variable)?;
-        if let Some(value) = self.state().state_versions.get(&variable.id()) {
-            return Ok(*value);
-        }
-        let result = self.state().alloc_typed(
-            variable.physical_shape(),
-            variable.rank(),
-            variable.data_type(),
-        );
+    /// The variable's value at this point of the graph. It reflects an earlier assign only in
+    /// executables that perform that assign. MIL `read_state`.
+    pub fn read_variable(&self, input: &Tensor) -> Result<Tensor, GraphError> {
+        self.ensure_state(*input)?;
+        let result =
+            self.state()
+                .alloc_typed(input.physical_shape(), input.rank(), input.data_type());
         self.state().ops.push((
             Op::StateRead(StateReadOp {
                 top: result,
-                state: *variable,
+                state: *input,
             }),
             result,
         ));
         Ok(result)
     }
 
-    pub fn assign_variable(
-        &self,
-        variable: &Tensor,
-        value: &Tensor,
-    ) -> Result<Operation, GraphError> {
-        self.ensure_variable(*variable)?;
+    /// Writes `value` into the variable when the returned operation is one of the executable's target
+    /// operations. MIL `write_state`.
+    pub fn assign_variable(&self, input: &Tensor, value: &Tensor) -> Result<Operation, GraphError> {
+        self.ensure_state(*input)?;
         self.check_tensor(*value)?;
         ensure(
-            value.data_type() == variable.data_type(),
+            value.data_type() == input.data_type(),
             GraphError::UnsupportedDataType("state assignment storage type differs"),
         )?;
         ensure(
-            value.physical_shape() == variable.physical_shape(),
+            value.physical_shape() == input.physical_shape(),
             GraphError::ShapeMismatch("state assignment shape differs"),
         )?;
-        let result = self.state().alloc_typed(
-            variable.physical_shape(),
-            variable.rank(),
-            variable.data_type(),
-        );
+        let result =
+            self.state()
+                .alloc_typed(input.physical_shape(), input.rank(), input.data_type());
         let mut state = self.state();
-        let previous = state.state_versions.get(&variable.id()).copied();
         state.ops.push((
             Op::StateWrite(StateWriteOp {
                 top: result,
-                state: *variable,
-                previous,
+                state: *input,
                 bottom: *value,
             }),
             result,
         ));
-        state.state_versions.insert(variable.id(), result);
         Ok(state_operation(result))
     }
 
+    /// Writes `update` into the variable from the runtime scalar Int32 row `position` and channel
+    /// `channel`, when the returned operation is a target operation. MIL `slice_update` and
+    /// `write_state`; the begin and end vectors are assembled in the program because the ANE takes
+    /// dynamic offsets only as scalar parameters.
     pub fn assign_variable_rows(
         &self,
-        variable: &Tensor,
+        input: &Tensor,
         update: &Tensor,
         position: &Tensor,
         channel: usize,
     ) -> Result<Operation, GraphError> {
-        self.ensure_variable(*variable)?;
+        self.ensure_state(*input)?;
         self.check_tensor(*update)?;
         ensure(
-            update.data_type() == variable.data_type(),
+            update.data_type() == input.data_type(),
             GraphError::UnsupportedDataType("state update storage type differs"),
         )?;
         self.check_tensor(*position)?;
-        let shape = variable.physical_shape();
+        let shape = input.physical_shape();
         ensure(
             self.state().inputs.iter().any(|(t, d)| {
                 t.id() == position.id()
@@ -150,15 +151,13 @@ impl Graph {
         )?;
         let result = self
             .state()
-            .alloc_typed(shape, variable.rank(), variable.data_type());
+            .alloc_typed(shape, input.rank(), input.data_type());
         let mut state = self.state();
-        let previous = state.state_versions.get(&variable.id()).copied();
         state.ops.push((
             Op::StateUpdate(StateUpdateOp {
                 top: result,
                 bottom: *update,
-                state: *variable,
-                previous,
+                state: *input,
                 position: *position,
                 rows: update_shape[2],
                 channel,
@@ -166,21 +165,21 @@ impl Graph {
             }),
             result,
         ));
-        state.state_versions.insert(variable.id(), result);
         Ok(state_operation(result))
     }
 
-    fn ensure_variable(&self, variable: Tensor) -> Result<(), GraphError> {
-        self.check_tensor(variable)?;
+    fn ensure_state(&self, input: Tensor) -> Result<(), GraphError> {
+        self.check_tensor(input)?;
         ensure(
             self.state().inputs.iter().any(|(tensor, dtype)| {
-                *tensor == variable
+                *tensor == input
                     && matches!(dtype, DataType::Float16 | DataType::Int8 | DataType::UInt8)
             }),
-            GraphError::InvalidArgument("tensor is not a variable"),
+            GraphError::InvalidArgument("tensor is not a state"),
         )
     }
 
+    /// A Float16 constant. Identical constants are stored once per model.
     pub fn constant<const RANK: usize>(
         &self,
         data: &[f32],
@@ -189,6 +188,7 @@ impl Graph {
         self.constant_values(data, logical_shape(&shape))
     }
 
+    /// A constant from raw Float16, Int8 or UInt8 bytes.
     pub fn constant_with_bytes<const RANK: usize>(
         &self,
         data: &[u8],
@@ -209,53 +209,7 @@ impl Graph {
         let blob = WeightBlob::from_bytes(data, physical.iter().product(), weight_type)?;
         let mut state = self.state();
         let tensor = state.alloc_typed(physical, RANK, dtype);
-        state.constants.insert(tensor.id(), (blob, physical));
+        state.constants.insert(tensor.id(), blob);
         Ok(tensor)
-    }
-
-    pub fn constant_with_scalar<const RANK: usize>(
-        &self,
-        scalar: f32,
-        shape: [usize; RANK],
-    ) -> Result<Tensor, GraphError> {
-        self.constant_scalar(scalar, logical_shape(&shape))
-    }
-
-    pub fn boolean_constant(&self, value: bool) -> Result<Tensor, GraphError> {
-        let value = self.constant_scalar(if value { 1.0 } else { 0.0 }, &[])?;
-        self.cast(&value, DataType::Bool)
-    }
-
-    pub fn fill_like(&self, input: &Tensor, value: f32) -> Result<Tensor, GraphError> {
-        self.check_tensor(*input)?;
-        self.constant_scalar(value, input.shape())
-    }
-
-    pub fn range(&self, start: f32, step: f32, count: usize) -> Result<Tensor, GraphError> {
-        ensure(
-            start.is_finite() && step.is_finite() && step != 0.0 && count > 0,
-            GraphError::InvalidArgument("invalid constant range"),
-        )?;
-        checked_shape(&[count])?;
-        let values: Vec<_> = (0..count).map(|i| start + step * i as f32).collect();
-        ensure(values.iter().all(|v| v.is_finite()), GraphError::Overflow)?;
-        self.constant(&values, [count])
-    }
-
-    pub fn coordinate_along_axis<const RANK: usize>(
-        &self,
-        shape: [usize; RANK],
-        axis: usize,
-    ) -> Result<Tensor, GraphError> {
-        checked_shape(logical_shape(&shape))?;
-        ensure(
-            axis < RANK,
-            GraphError::InvalidAxes("coordinate axis exceeds rank"),
-        )?;
-        let range = self.range(0.0, 1.0, shape[axis])?;
-        let mut expanded = [1; RANK];
-        expanded[axis] = shape[axis];
-        let range = self.reshape(&range, expanded)?;
-        self.broadcast_to(&range, shape)
     }
 }

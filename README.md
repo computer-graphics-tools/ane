@@ -2,7 +2,7 @@
 
 Rust bindings for Apple Neural Engine (ANE) via the private `AppleNeuralEngine.framework`.
 
-Provides a typed graph builder that lowers through MPSGraph and Apple's ANE compiler, loads the result through `_ANEModel` and `_ANEClient`, and runs it on IOSurface-backed zero-copy buffers. A graph that cannot run entirely on ANE returns an error; there is no CPU or GPU fallback.
+Provides a typed graph builder that emits MIL, compiles it with Apple's ANE compiler through `_ANEInMemoryModel`, and runs it on IOSurface-backed zero-copy buffers. A graph that cannot run entirely on ANE returns an error; there is no CPU or GPU fallback.
 
 ## Example
 
@@ -25,7 +25,7 @@ fn main() -> Result<(), ane::Error> {
 }
 ```
 
-Shapes have up to four dimensions; spatial operations use NCHW. `run` takes inputs in `executable.input_tensors()` order and returns results in target order.
+The API follows MPSGraph (`placeholder`, `matrix_multiplication`, `read_variable`, `compile`, `run`), but every graph method is one operation the ANE runs natively; an operation the ANE cannot run fails to compile. `run` takes inputs in `executable.feed_tensors()` order and returns results in target order; passing your own result buffers reuses their mapped request. `compile_shared` compiles several target sets into one ANE model so they share weights and variables. Shapes have up to four dimensions; spatial operations use NCHW.
 
 ## Mutable weights
 
@@ -33,7 +33,7 @@ Shapes have up to four dimensions; spatial operations use NCHW. `run` takes inpu
 cargo run --release --example mutable_matmul
 ```
 
-The example binds FP16 weight IOSurfaces as inputs, rewrites them from the CPU between executions without recompiling, and checks every output exactly.
+The example binds an FP16 weight IOSurface as a variable, rewrites it from the CPU between executions without recompiling, and checks every output exactly.
 
 ## Research
 

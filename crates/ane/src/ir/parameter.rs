@@ -1,3 +1,5 @@
+use std::fmt::{self, Display, Formatter};
+
 macro_rules! names {
     ($($variant:ident => $name:literal),* $(,)?) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -22,13 +24,15 @@ names! {
     Value => "value",
     AttnMask => "attn_mask",
     Coordinates => "coordinates",
-    TransformMatrix => "transform_matrix",
     Values => "values",
     Data => "data",
     Scale => "scale",
     Offset => "offset",
     Indices => "indices",
     Lut => "lut",
+    LutScale => "lut_scale",
+    LutOffset => "lut_offset",
+    VectorAxis => "vector_axis",
     Mask => "mask",
     NonzeroData => "nonzero_data",
     DataMask => "data_mask",
@@ -57,7 +61,6 @@ names! {
     Reps => "reps",
     BlockSize => "block_size",
     UpscaleFactor => "upscale_factor",
-    DownscaleFactor => "downscale_factor",
     BlockShape => "block_shape",
     Crops => "crops",
     Pad => "pad",
@@ -84,14 +87,18 @@ names! {
     PaddingValue => "padding_value",
     CoordinatesMode => "coordinates_mode",
     AlignCorners => "align_corners",
-    OutputHeight => "output_height",
-    OutputWidth => "output_width",
     ZeroPoint => "zero_point",
     OutputDtype => "output_dtype",
+    Gamma => "gamma",
+    Mean => "mean",
+    Variance => "variance",
+    Update => "update",
+    Paddings => "paddings",
+    SplitSizes => "split_sizes",
 }
 
-impl std::fmt::Display for Parameter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for Parameter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }

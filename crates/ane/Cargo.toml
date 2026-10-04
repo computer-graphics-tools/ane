@@ -9,14 +9,6 @@ repository = "https://github.com/computer-graphics-tools/ane"
 readme = "../../README.md"
 keywords = ["apple", "neural-engine", "ane", "machine-learning"]
 categories = ["api-bindings", "hardware-support"]
-build = "build.rs"
-
-[lib]
-crate-type = ["lib"]
-
-[[example]]
-name = "mutable_matmul"
-path = "examples/mutable_matmul.rs"
 
 [dependencies]
 thiserror.workspace = true
@@ -30,17 +22,6 @@ half.workspace = true
 bytemuck.workspace = true
 serde.workspace = true
 plist.workspace = true
-objc2-metal-performance-shaders-graph = { version = "0.3.2", default-features = false, features = [
-    "MPSGraph", "MPSGraphCore", "MPSGraphDevice", "MPSGraphExecutable", "MPSGraphMemoryOps",
-    "MPSGraphOperation", "MPSGraphTensor", "MPSGraphTensorData", "MPSGraphArithmeticOps",
-    "MPSGraphActivationOps", "MPSGraphConvolutionOps", "MPSGraphConvolutionTransposeOps",
-    "MPSGraphGatherOps", "MPSGraphMatrixMultiplicationOps", "MPSGraphNormalizationOps",
-    "MPSGraphPoolingOps", "MPSGraphQuantizationOps", "MPSGraphReductionOps", "MPSGraphResizeOps",
-    "MPSGraphSampleGridOps", "MPSGraphTensorShapeOps", "MPSGraphTopKOps",
-    "objc2-metal-performance-shaders", "block2",
-] }
-objc2-metal-performance-shaders = { version = "0.3.2", default-features = false, features = ["MPSCoreTypes"] }
-objc2-metal = { version = "0.3.2", default-features = false, features = ["MTLDevice", "MTLCommandQueue", "MTLBuffer", "MTLResource"] }
 
 [dev-dependencies]
 rand.workspace = true

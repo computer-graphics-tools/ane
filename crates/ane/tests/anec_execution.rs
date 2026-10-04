@@ -1,12 +1,13 @@
 use ane::{
-    CompilationCache, CompilationDescriptor, Convolution2dDescriptor, DataType, Graph, PadFillMode,
-    SamplingMode, Tensor, TensorData,
+    BlockwiseQuantization, CompilationDescriptor, Convolution2dDescriptor, DataType, Graph,
+    PadFillMode, PadMode, Palettization, Pooling2dDescriptor, ResizeSamplingMode, Tensor,
+    TensorData, WeightDataType,
 };
 use half::f16;
+use std::future::Future;
 
 #[test]
-fn cached_effects_keep_independent_state() -> Result<(), ane::Error> {
-    let mut cache = CompilationCache::new(2, 1024 * 1024)?;
+fn separately_compiled_graphs_keep_independent_state() -> Result<(), ane::Error> {
     let mut executables = Vec::new();
     for initial in [0.0, 10.0] {
         let graph = Graph::new();
@@ -16,18 +17,17 @@ fn cached_effects_keep_independent_state() -> Result<(), ane::Error> {
         let next = graph.addition(&old, &input)?;
         let update = graph.assign_variable(&state, &next)?;
         let output = graph.square(&input)?;
-        let executable = graph.compile_cached(&[output], &[&update], None, &mut cache)?;
-        executables.push((executable, input, output, state));
+        let executable = graph.compile(&[output], &[&update], None)?;
+        executables.push((executable, input, state));
     }
-    assert_eq!(cache.hits(), 1);
     for index in [0, 1, 0] {
-        let (executable, input, _, _) = &executables[index];
+        let (executable, input, _) = &executables[index];
         let data = executable.input(*input)?.allocate()?;
         data.copy_from_f32(&[1.0; 4096])?;
         let result = executable.run(&[&data], None, None)?;
         assert!(result[0].read_f32()?.iter().all(|&v| v == 1.0));
     }
-    for ((executable, _, _, state), expected) in executables.iter().zip([2.0, 11.0]) {
+    for ((executable, _, state), expected) in executables.iter().zip([2.0, 11.0]) {
         assert!(
             executable
                 .variable_data(state)?
@@ -72,10 +72,10 @@ fn direct_anec_execution_preserves_bindings_state_and_packed_io() -> Result<(), 
     let state = graph.variable_with_data(&[0.; 4096], [64, 64])?;
     let previous = graph.read_variable(&state)?;
     let next = graph.addition(&previous, &input)?;
-    graph.assign_variable(&state, &next)?;
+    let assign = graph.assign_variable(&state, &next)?;
     let result = graph.read_variable(&state)?;
-    let executable = graph.compile(&[result], &[], None)?;
-    assert!(executable.report().anec_bytes > 0);
+    let executable = graph.compile(&[result], &[&assign], None)?;
+    assert!(executable.report().mil_bytes > 0);
     let input_data = executable.input(input)?.allocate()?;
     input_data.copy_from_f32(&[1.; 4096])?;
     let outputs = executable.allocate_outputs()?;
@@ -98,9 +98,9 @@ fn direct_anec_execution_preserves_bindings_state_and_packed_io() -> Result<(), 
     let input = graph.placeholder([1, 1, 1, 64], DataType::Float32)?;
     let position = graph.placeholder([1], DataType::Int32)?;
     let state = graph.variable_with_data(&[1.; 8192], [1, 2, 64, 64])?;
-    graph.assign_variable_rows(&state, &input, &position, 1)?;
+    let assign = graph.assign_variable_rows(&state, &input, &position, 1)?;
     let result = graph.read_variable(&state)?;
-    let executable = graph.compile(&[result], &[], None)?;
+    let executable = graph.compile(&[result], &[&assign], None)?;
     let input_data = executable.input(input)?.allocate()?;
     let position_data = executable.input(position)?.allocate()?;
     let outputs = executable.allocate_outputs()?;
@@ -147,11 +147,11 @@ fn direct_anec_execution_preserves_bindings_state_and_packed_io() -> Result<(), 
     let graph = Graph::new();
     let input = graph.placeholder([64, 64], DataType::Float16)?;
     let indices = graph.placeholder([64], DataType::UInt16)?;
-    let output = graph.gather(&input, &indices, 0)?;
+    let output = graph.gather(&input, &indices, 1)?;
     let executable = graph.compile(&[output], &[], None)?;
     let input_data = executable.input(input)?.allocate()?;
     let index_data = executable.input(indices)?.allocate()?;
-    input_data.copy_from_f32(&(0..4096).map(|i| (i / 64) as f32).collect::<Vec<_>>())?;
+    input_data.copy_from_f32(&(0..4096).map(|i| (i % 64) as f32).collect::<Vec<_>>())?;
     index_data.write(&(0..64).rev().map(|i| i as u16).collect::<Vec<_>>())?;
     let result = executable.run(&[&input_data, &index_data], None, None)?;
     assert!(
@@ -159,13 +159,17 @@ fn direct_anec_execution_preserves_bindings_state_and_packed_io() -> Result<(), 
             .read_f32()?
             .iter()
             .enumerate()
-            .all(|(i, &v)| v == (63 - i / 64) as f32)
+            .all(|(i, &v)| v == (63 - i % 64) as f32)
     );
     drop(executable);
 
     let graph = Graph::new();
     let input = graph.placeholder([64, 64], DataType::Float16)?;
-    let weights = graph.palettized_weights(&[0xe4; 1024], 2, [64, 64], &[0., 1., 2., 3.])?;
+    let weights = graph.palettized_weights(
+        &[0xe4; 1024],
+        [64, 64],
+        &Palettization::new(2, &[0., 1., 2., 3.]),
+    )?;
     let output = graph.matrix_multiplication(&input, &weights, false, false)?;
     let executable = graph.compile(&[output], &[], None)?;
     let input_data = executable.input(input)?.allocate()?;
@@ -200,18 +204,16 @@ fn direct_anec_execution_preserves_bindings_state_and_packed_io() -> Result<(), 
     assert!(result[0].read::<i8>()?.iter().all(|&v| v == 6));
     drop(executable);
 
-    let mut cache = CompilationCache::new(2, 1024 * 1024)?;
-    let build = |initial: f32, cache: &mut CompilationCache| -> Result<_, ane::Error> {
+    let build = |initial: f32| -> Result<_, ane::Error> {
         let graph = Graph::new();
         let x = graph.placeholder([64, 64], DataType::Float32)?;
         let w = graph.variable_with_data(&[initial; 4096], [64, 64])?;
         let value = graph.read_variable(&w)?;
         let y = graph.matrix_multiplication(&x, &value, false, false)?;
-        Ok((graph.compile_cached(&[y], &[], None, cache)?, x, w, y))
+        Ok((graph.compile(&[y], &[], None)?, x, w))
     };
-    let (a, x, wa, ya) = build(1., &mut cache)?;
-    let (b, _, wb, _) = build(2., &mut cache)?;
-    assert_eq!(cache.hits(), 1);
+    let (a, x, wa) = build(1.)?;
+    let (b, _, wb) = build(2.)?;
     assert_ne!(
         a.variable_data(&wa)?.surface().surfaceID(),
         b.variable_data(&wb)?.surface().surfaceID()
@@ -230,7 +232,7 @@ fn direct_anec_execution_preserves_bindings_state_and_packed_io() -> Result<(), 
             .iter()
             .all(|&v| v == 128.)
     );
-    let output = a.output(ya)?.allocate()?;
+    let output = a.allocate_outputs()?.remove(0);
     for _ in 0..3 {
         let results = a.run_async(&[&input], Some(&[&output]), None)?.wait()?;
         assert_eq!(
@@ -243,24 +245,14 @@ fn direct_anec_execution_preserves_bindings_state_and_packed_io() -> Result<(), 
 }
 
 #[test]
-fn runtime_convolution_weights() -> Result<(), ane::Error> {
+fn convolution_rejects_runtime_weights() -> Result<(), ane::Error> {
     let graph = Graph::new();
     let input = graph.placeholder([1, 64, 1, 64], DataType::Float16)?;
     let weights = graph.placeholder([64, 64, 1, 1], DataType::Float16)?;
-    let output = graph.convolution_2d_1x1(&input, &weights, None)?;
-    let executable = graph.compile(&[output], &[], None)?;
-    let input_data = executable.input(input)?.allocate()?;
-    let weight_data = executable.input(weights)?.allocate()?;
-    input_data.copy_from_f32(&[1.; 4096])?;
-    let outputs = executable.allocate_outputs()?;
-    let results: Vec<_> = outputs.iter().collect();
-    let feeds = [&input_data, &weight_data];
-    for value in [1., 2.] {
-        weight_data.copy_from_f32(&[value; 4096])?;
-        executable.run(&feeds, Some(&results), None)?;
-        assert!(outputs[0].read_f32()?.iter().all(|&v| v == 64. * value));
-    }
-    drop(executable);
+    assert!(matches!(
+        graph.convolution_2d(&input, &weights, None, &Convolution2dDescriptor::default()),
+        Err(ane::GraphError::NonConstantWeights(_))
+    ));
     Ok(())
 }
 
@@ -270,16 +262,20 @@ fn native_palettized_linear() -> Result<(), ane::Error> {
     let input = graph.placeholder([128, 128], DataType::Float16)?;
     let weights = graph.palettized_weights(
         &[0x10; 8192],
-        4,
         [128, 128],
-        &[
-            0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15.,
-        ],
+        &Palettization::new(
+            4,
+            &[
+                0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15.,
+            ],
+        ),
     )?;
     let output = graph.matrix_multiplication(&input, &weights, false, false)?;
-    let mlir = graph.program(&[output], &[DataType::Float32])?.mlir()?;
-    assert!(mlir.contains("\"mps.dequantize_lut\""));
-    assert!(mlir.contains("tensor<128x128x1x1xui4>"));
+    let mil = graph.program(&[output], &[DataType::Float32])?.mil()?;
+    assert!(
+        mil.text
+            .contains("constexpr_lut_to_dense(indices = tensor<uint4, [1, 1, 128, 128]>")
+    );
     let executable = graph.compile(&[output], &[], None)?;
     let data = executable.input(input)?.allocate()?;
     data.copy_from_f32(
@@ -299,41 +295,11 @@ fn native_palettized_linear() -> Result<(), ane::Error> {
 }
 
 #[test]
-fn runtime_quantization_scales() -> Result<(), ane::Error> {
-    let graph = Graph::new();
-    let input = graph.placeholder([64, 64], DataType::Float16)?;
-    let scale = graph.placeholder([1], DataType::Float16)?;
-    let codes = graph.quantize_with_scale_tensor(&input, &scale, 0, None, DataType::Int8)?;
-    let restored = graph.dequantize_with_scale_tensor(&codes, &scale, 0, None)?;
-    let executable = graph.compile(&[codes, restored], &[], None)?;
-    let data = executable.input(input)?.allocate()?;
-    let scale_data = executable.input(scale)?.allocate()?;
-    data.copy_from_f32(&[1.5; 4096])?;
-    let outputs = executable.allocate_outputs()?;
-    let results: Vec<_> = outputs.iter().collect();
-    let feeds = [&data, &scale_data];
-    for (factor, expected) in [(0.25, 6i8), (0.5, 3)] {
-        scale_data.copy_from_f32(&[factor])?;
-        executable.run(&feeds, Some(&results), None)?;
-        let actual = outputs[0].read::<i8>()?;
-        assert!(
-            actual.iter().all(|&v| v == expected),
-            "scale {factor}, codes {:?}",
-            &actual[..8]
-        );
-        assert!(outputs[1].read_f32()?.iter().all(|&v| v == 1.5));
-    }
-    Ok(())
-}
-
-#[test]
-fn byte_casts_and_packed_results() -> Result<(), ane::Error> {
+fn byte_casts_round_half_away_from_zero() -> Result<(), ane::Error> {
     let graph = Graph::new();
     let input = graph.placeholder([64, 64], DataType::Float16)?;
     let bytes = graph.cast(&input, DataType::Int8)?;
-    let packed = graph.pack_signed_int4(&input)?;
-    assert_eq!(packed.data_type(), DataType::UInt8);
-    let executable = graph.compile(&[bytes, packed], &[], None)?;
+    let executable = graph.compile(&[bytes], &[], None)?;
     let data = executable.input(input)?.allocate()?;
     data.copy_from_f32(
         &(0..4096)
@@ -351,10 +317,9 @@ fn byte_casts_and_packed_results() -> Result<(), ane::Error> {
             .enumerate()
             .all(|(i, &v)| v == if i % 2 == 0 { -8 } else { 7 })
     );
-    assert!(outputs[1].read::<u8>()?.iter().all(|&v| v == 0x78));
     data.copy_from_f32(&[1.75; 4096])?;
     executable.run(&feeds, Some(&results), None)?;
-    assert!(outputs[0].read::<i8>()?.iter().all(|&v| v == 1));
+    assert!(outputs[0].read::<i8>()?.iter().all(|&v| v == 2));
     Ok(())
 }
 
@@ -365,9 +330,9 @@ fn byte_state() -> Result<(), ane::Error> {
     let state = graph.variable_with_tensor_data(&state_data)?;
     let update = graph.placeholder([1, 1, 1, 64], DataType::Int8)?;
     let position = graph.placeholder([1], DataType::Int32)?;
-    graph.assign_variable_rows(&state, &update, &position, 0)?;
+    let assign = graph.assign_variable_rows(&state, &update, &position, 0)?;
     let output = graph.read_variable(&state)?;
-    let executable = graph.compile(&[output], &[], None)?;
+    let executable = graph.compile(&[output], &[&assign], None)?;
     let update_data = executable.input(update)?.allocate()?;
     let position_data = executable.input(position)?.allocate()?;
     let outputs = executable.allocate_outputs()?;
@@ -429,7 +394,11 @@ fn palette_bit_widths_and_groups() -> Result<(), ane::Error> {
             println!("native {bits}-bit palette, transpose={transpose}");
             let graph = Graph::new();
             let input = graph.placeholder([128, 128], DataType::Float16)?;
-            let weights = graph.palettized_weights(&packed, bits, [128, 128], &palette)?;
+            let weights = graph.palettized_weights(
+                &packed,
+                [128, 128],
+                &Palettization::new(bits, &palette),
+            )?;
             let output = graph.matrix_multiplication(&input, &weights, false, transpose)?;
             let executable = graph.compile(&[output], &[], None)?;
             let data = executable.input(input)?.allocate()?;
@@ -462,8 +431,14 @@ fn grouped_palette() -> Result<(), ane::Error> {
     let input = graph.placeholder([256, 256], DataType::Float16)?;
     let mut palette = (0..16).map(|v| v as f32 * 0.125).collect::<Vec<_>>();
     palette.extend((0..16).map(|v| v as f32 * 0.25));
-    let weights =
-        graph.palettized_weights_with_groups(&[0x10; 16384], 4, [256, 128], [2, 1], &palette)?;
+    let weights = graph.palettized_weights(
+        &[0x10; 16384],
+        [256, 128],
+        &Palettization {
+            group_shape: [2, 1],
+            ..Palettization::new(4, &palette)
+        },
+    )?;
     let output = graph.matrix_multiplication(&input, &weights, false, false)?;
     let executable = graph.compile(&[output], &[], None)?;
     let data = executable.input(input)?.allocate()?;
@@ -490,7 +465,7 @@ fn evaluate(
 ) -> Result<Vec<f32>, ane::Error> {
     let executable = graph.compile(&[output], &[], None)?;
     let data = executable
-        .input_tensors()
+        .feed_tensors()
         .iter()
         .map(|tensor| {
             let (_, values) = feeds.iter().find(|(t, _)| t == tensor).unwrap();
@@ -507,7 +482,7 @@ fn evaluate(
 fn bilinear_resize_uses_half_pixel_centers() -> Result<(), ane::Error> {
     let graph = Graph::new();
     let input = graph.placeholder([1, 1, 2, 2], DataType::Float32)?;
-    let output = graph.resize(&input, [4, 4], SamplingMode::Bilinear)?;
+    let output = graph.resize_bilinear(&input, [4, 4], ResizeSamplingMode::UnalignCorners)?;
     let actual = evaluate(&graph, &[(input, &[0., 1., 2., 3.])], output)?;
     let axis = [0., 0.25, 0.75, 1.];
     let expected: Vec<f32> = (0..16).map(|i| 2. * axis[i / 4] + axis[i % 4]).collect();
@@ -516,13 +491,12 @@ fn bilinear_resize_uses_half_pixel_centers() -> Result<(), ane::Error> {
 }
 
 #[test]
-fn boolean_attention_mask_excludes_false_positions() -> Result<(), ane::Error> {
+fn additive_attention_mask_excludes_masked_positions() -> Result<(), ane::Error> {
     let graph = Graph::new();
     let query = graph.placeholder([1, 1, 2, 4], DataType::Float32)?;
     let key = graph.placeholder([1, 1, 2, 4], DataType::Float32)?;
     let value = graph.placeholder([1, 1, 2, 4], DataType::Float32)?;
-    let keep = graph.placeholder([1, 1, 2, 2], DataType::Float32)?;
-    let mask = graph.cast(&keep, DataType::Bool)?;
+    let mask = graph.placeholder([1, 1, 2, 2], DataType::Float32)?;
     let output = graph.scaled_dot_product_attention(&query, &key, &value, Some(&mask))?;
     let actual = evaluate(
         &graph,
@@ -530,7 +504,7 @@ fn boolean_attention_mask_excludes_false_positions() -> Result<(), ane::Error> {
             (query, &[1.; 8]),
             (key, &[1.; 8]),
             (value, &[0., 0., 0., 0., 10., 10., 10., 10.]),
-            (keep, &[1., 0., 1., 1.]),
+            (mask, &[0., f32::NEG_INFINITY, 0., 0.]),
         ],
         output,
     )?;
@@ -539,62 +513,18 @@ fn boolean_attention_mask_excludes_false_positions() -> Result<(), ane::Error> {
 }
 
 #[test]
-fn crop_resize_samples_aligned_box_corners() -> Result<(), ane::Error> {
-    let image: Vec<f32> = (0..32)
-        .map(|i| (i % 16) as f32 + 100. * (i / 16) as f32)
-        .collect();
-    let full = [0., 1.5, 3.];
-    for (normalized, corners, rows, columns) in [
-        (
-            true,
-            [0.25, 0., 1., 0.5, 0., 0., 1., 1.],
-            [0., 0.75, 1.5],
-            [0.75, 1.875, 3.],
-        ),
-        (
-            false,
-            [1., 0., 3., 2., 0., 0., 3., 3.],
-            [0., 1., 2.],
-            [1., 2., 3.],
-        ),
-    ] {
-        let graph = Graph::new();
-        let input = graph.placeholder([2, 1, 4, 4], DataType::Float32)?;
-        let boxes = graph.placeholder([2, 4], DataType::Float32)?;
-        let selection = graph.placeholder([2], DataType::Float32)?;
-        let indices = graph.cast(&selection, DataType::UInt16)?;
-        let output = graph.crop_resize(&input, &boxes, &indices, [3, 3], normalized)?;
-        let actual = evaluate(
-            &graph,
-            &[(input, &image), (boxes, &corners), (selection, &[1., 0.])],
-            output,
-        )?;
-        let expected = (0..18).map(|i| match (i / 9, i / 3 % 3, i % 3) {
-            (0, r, c) => 100. + 4. * rows[r] + columns[c],
-            (_, r, c) => 4. * full[r] + full[c],
-        });
-        for (actual, expected) in actual.iter().zip(expected) {
-            assert!(
-                (actual - expected).abs() <= 0.05,
-                "{normalized}: {actual} vs {expected}"
-            );
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn runtime_pointwise_convolution_adds_bias() -> Result<(), ane::Error> {
+fn pointwise_convolution_adds_bias() -> Result<(), ane::Error> {
     let graph = Graph::new();
     let input = graph.placeholder([1, 2, 1, 2], DataType::Float32)?;
-    let weights = graph.placeholder([2, 2, 1, 1], DataType::Float16)?;
+    let weights = graph.constant(&[1., 0., 1., 1.], [2, 2, 1, 1])?;
     let bias = graph.constant(&[10., 20.], [2])?;
-    let output = graph.convolution_2d_1x1(&input, &weights, Some(&bias))?;
-    let actual = evaluate(
-        &graph,
-        &[(input, &[1., 2., 3., 4.]), (weights, &[1., 0., 1., 1.])],
-        output,
+    let output = graph.convolution_2d(
+        &input,
+        &weights,
+        Some(&bias),
+        &Convolution2dDescriptor::default(),
     )?;
+    let actual = evaluate(&graph, &[(input, &[1., 2., 3., 4.])], output)?;
     assert_eq!(actual, [11., 12., 24., 26.]);
     Ok(())
 }
@@ -614,32 +544,19 @@ fn round_breaks_ties_away_from_zero() -> Result<(), ane::Error> {
 }
 
 #[test]
-fn normalizations_fold_epsilon_into_reciprocal_square_root() -> Result<(), ane::Error> {
+fn layer_norm_folds_epsilon_into_reciprocal_square_root() -> Result<(), ane::Error> {
     let values = [1., 2., 3., 4., -1., 0., 1., 6.];
-    for rms in [false, true] {
-        let graph = Graph::new();
-        let input = graph.placeholder([2, 4], DataType::Float32)?;
-        let scale = graph.constant(&[1., 2., 1., 0.5], [4])?;
-        let output = if rms {
-            graph.rms_norm(&input, &[-1], &scale, 1e-3)?
-        } else {
-            graph.layer_norm(&input, &[-1], &scale, None, 1e-3)?
-        };
-        let actual = evaluate(&graph, &[(input, &values)], output)?;
-        for (row, actual) in values.chunks(4).zip(actual.chunks(4)) {
-            let mean = if rms {
-                0.
-            } else {
-                row.iter().sum::<f32>() / 4.
-            };
-            let variance = row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / 4.;
-            for ((value, actual), scale) in row.iter().zip(actual).zip([1., 2., 1., 0.5]) {
-                let expected = (value - mean) / (variance + 1e-3).sqrt() * scale;
-                assert!(
-                    (actual - expected).abs() < 1e-2,
-                    "{rms}: {actual} vs {expected}"
-                );
-            }
+    let graph = Graph::new();
+    let input = graph.placeholder([2, 4], DataType::Float32)?;
+    let scale = graph.constant(&[1., 2., 1., 0.5], [4])?;
+    let output = graph.layer_norm(&input, &[-1], Some(&scale), None, 1e-3)?;
+    let actual = evaluate(&graph, &[(input, &values)], output)?;
+    for (row, actual) in values.chunks(4).zip(actual.chunks(4)) {
+        let mean = row.iter().sum::<f32>() / 4.;
+        let variance = row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / 4.;
+        for ((value, actual), scale) in row.iter().zip(actual).zip([1., 2., 1., 0.5]) {
+            let expected = (value - mean) / (variance + 1e-3).sqrt() * scale;
+            assert!((actual - expected).abs() < 1e-2, "{actual} vs {expected}");
         }
     }
     Ok(())
@@ -655,12 +572,6 @@ fn padding_modes_and_mirrored_width_limits() -> Result<(), ane::Error> {
         ),
         (PadFillMode::Reflect, 4, None),
         (
-            PadFillMode::Symmetric,
-            4,
-            Some(vec![4., 3., 2., 1., 1., 2., 3., 4., 4., 3., 2., 1.]),
-        ),
-        (PadFillMode::Symmetric, 5, None),
-        (
             PadFillMode::Replicate,
             3,
             Some(vec![1., 1., 1., 1., 2., 3., 4., 4., 4., 4.]),
@@ -668,7 +579,7 @@ fn padding_modes_and_mirrored_width_limits() -> Result<(), ane::Error> {
     ] {
         let graph = Graph::new();
         let input = graph.placeholder([1, 1, 1, 4], DataType::Float32)?;
-        let output = graph.pad(&input, 0, 0, width, width, mode, 0.0);
+        let output = graph.pad(&input, [0, 0, width, width], mode, 0.0);
         match expected {
             Some(expected) => {
                 assert_eq!(
@@ -679,40 +590,6 @@ fn padding_modes_and_mirrored_width_limits() -> Result<(), ane::Error> {
             None => assert!(matches!(output, Err(ane::GraphError::OutOfBounds(_)))),
         }
     }
-    Ok(())
-}
-
-#[test]
-fn matrix_multiplication_treats_vectors_like_numpy() -> Result<(), ane::Error> {
-    let matrix = [1., 2., 3., 4., 5., 6.];
-    let vector = [1., 0., 1.];
-    let graph = Graph::new();
-    let x = graph.placeholder([2, 3], DataType::Float32)?;
-    let y = graph.placeholder([3], DataType::Float32)?;
-    let column = graph.matrix_multiplication(&x, &y, false, false)?;
-    assert_eq!(column.shape(), [2]);
-    assert_eq!(
-        evaluate(&graph, &[(x, &matrix), (y, &vector)], column)?,
-        [4., 10.]
-    );
-    let graph = Graph::new();
-    let x = graph.placeholder([2], DataType::Float32)?;
-    let y = graph.placeholder([2, 3], DataType::Float32)?;
-    let row = graph.matrix_multiplication(&x, &y, false, false)?;
-    assert_eq!(row.shape(), [3]);
-    assert_eq!(
-        evaluate(&graph, &[(x, &[1., 1.]), (y, &matrix)], row)?,
-        [5., 7., 9.]
-    );
-    let graph = Graph::new();
-    let x = graph.placeholder([3], DataType::Float32)?;
-    let y = graph.placeholder([3], DataType::Float32)?;
-    let dot = graph.matrix_multiplication(&x, &y, false, false)?;
-    assert!(dot.shape().is_empty());
-    assert_eq!(
-        evaluate(&graph, &[(x, &[1., 2., 3.]), (y, &vector)], dot)?,
-        [4.]
-    );
     Ok(())
 }
 
@@ -742,36 +619,15 @@ fn sixteen_bit_casts_come_from_bytes_not_floats() -> Result<(), ane::Error> {
 }
 
 #[test]
-fn boolean_inputs_and_outputs_cross_the_ane_boundary_as_bytes() -> Result<(), ane::Error> {
-    let graph = Graph::new();
-    let flags = graph.placeholder([8], DataType::Bool)?;
-    let inverted = graph.not(&flags)?;
-    let executable = graph.compile(&[inverted], &[], None)?;
-    let data = executable.input(flags)?.allocate()?;
-    let values = [true, false, false, true, true, true, false, false];
-    data.write(&values)?;
-    let result = executable.run(&[&data], None, None)?;
-    let expected: Vec<_> = values.iter().map(|v| !v).collect();
-    assert_eq!(&*result[0].read::<bool>()?, expected);
-    Ok(())
-}
-
-#[test]
 fn slice_update_places_on_ane() -> Result<(), ane::Error> {
     let graph = Graph::new();
-    let input = graph.placeholder([4, 4], DataType::Float32)?;
-    let update = graph.placeholder([2, 2], DataType::Float32)?;
-    let output = graph.slice_update(&input, &update, &[1, 2])?;
-    let actual = evaluate(
-        &graph,
-        &[(input, &[0.; 16]), (update, &[1., 2., 3., 4.])],
-        output,
-    )?;
-    let mut expected = [0.; 16];
-    expected[6] = 1.;
-    expected[7] = 2.;
-    expected[10] = 3.;
-    expected[11] = 4.;
+    let input = graph.placeholder([1, 2, 4, 4], DataType::Float32)?;
+    let update = graph.placeholder([1, 1, 4, 4], DataType::Float32)?;
+    let output = graph.slice_update(&input, &update, &[0, 1, 0, 0])?;
+    let patch: Vec<f32> = (1..=16).map(|v| v as f32).collect();
+    let actual = evaluate(&graph, &[(input, &[0.; 32]), (update, &patch)], output)?;
+    let mut expected = [0.; 32];
+    expected[16..].copy_from_slice(&patch);
     assert_eq!(actual, expected);
     Ok(())
 }
@@ -806,61 +662,18 @@ fn space_to_batch_round_trips_through_batch_to_space() -> Result<(), ane::Error>
 }
 
 #[test]
-fn logical_operations_follow_truth_tables() -> Result<(), ane::Error> {
+fn logical_and_crosses_the_ane_boundary_as_bytes() -> Result<(), ane::Error> {
     let graph = Graph::new();
     let x = graph.placeholder([4], DataType::Bool)?;
     let y = graph.placeholder([4], DataType::Bool)?;
     let and = graph.logical_and(&x, &y)?;
-    let or = graph.logical_or(&x, &y)?;
-    let xor = graph.logical_xor(&x, &y)?;
-    let executable = graph.compile(&[and, or, xor], &[], None)?;
+    let executable = graph.compile(&[and], &[], None)?;
     let left = executable.input(x)?.allocate()?;
     left.write(&[false, false, true, true])?;
     let right = executable.input(y)?.allocate()?;
     right.write(&[false, true, false, true])?;
     let result = executable.run(&[&left, &right], None, None)?;
     assert_eq!(&*result[0].read::<bool>()?, [false, false, false, true]);
-    assert_eq!(&*result[1].read::<bool>()?, [false, true, true, true]);
-    assert_eq!(&*result[2].read::<bool>()?, [false, true, true, false]);
-    Ok(())
-}
-
-#[test]
-fn band_part_and_one_hot_build_masks_on_ane() -> Result<(), ane::Error> {
-    let graph = Graph::new();
-    let input = graph.placeholder([1, 2, 4, 4], DataType::Float32)?;
-    let causal = graph.band_part(&input, -1, 0)?;
-    let banded = graph.band_part(&input, 1, 1)?;
-    let positions = graph.placeholder([3], DataType::Float32)?;
-    let indices = graph.cast(&positions, DataType::UInt16)?;
-    let hot = graph.one_hot(&indices, 5)?;
-    assert_eq!(hot.shape(), [3, 5]);
-    let executable = graph.compile(&[causal, banded, hot], &[], None)?;
-    let data = executable.input(input)?.allocate()?;
-    let values: Vec<f32> = (1..=32).map(|v| v as f32).collect();
-    data.copy_from_f32(&values)?;
-    let position_data = executable.input(positions)?.allocate()?;
-    position_data.copy_from_f32(&[4., 0., 2.])?;
-    let result = executable.run(&[&data, &position_data], None, None)?;
-    let keep = |lower: i64, upper: i64| -> Vec<f32> {
-        values
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| {
-                let (row, column) = ((i / 4 % 4) as i64, (i % 4) as i64);
-                let inside =
-                    (lower < 0 || row - column <= lower) && (upper < 0 || column - row <= upper);
-                if inside { v } else { 0. }
-            })
-            .collect()
-    };
-    assert_eq!(&*result[0].read_f32()?, keep(-1, 0));
-    assert_eq!(&*result[1].read_f32()?, keep(1, 1));
-    let mut expected = [0.; 15];
-    for (row, class) in [4, 0, 2].into_iter().enumerate() {
-        expected[row * 5 + class] = 1.;
-    }
-    assert_eq!(&*result[2].read_f32()?, expected);
     Ok(())
 }
 
@@ -868,8 +681,8 @@ fn band_part_and_one_hot_build_masks_on_ane() -> Result<(), ane::Error> {
 fn multi_axis_reductions_lower_to_one_operation() -> Result<(), ane::Error> {
     let graph = Graph::new();
     let input = graph.placeholder([2, 3, 4], DataType::Float32)?;
-    let mean = graph.mean(&input, &[1, 2])?;
-    let sum = graph.sum(&input, &[0, -1])?;
+    let mean = graph.reduction_mean(&input, &[1, 2])?;
+    let sum = graph.reduction_sum(&input, &[0, -1])?;
     let program = graph.program(&[mean, sum], &[DataType::Float32])?;
     assert_eq!(program.operations(), ["reduce_mean", "reduce_sum"]);
     let values: Vec<f32> = (0..24).map(|v| v as f32).collect();
@@ -898,11 +711,15 @@ fn palettized_convolution_weights_stay_packed() -> Result<(), ane::Error> {
     let palette: Vec<f32> = (0..16).map(|i| 0.5 * (i as f32 - 8.)).collect();
     let graph = Graph::new();
     let input = graph.placeholder([1, inputs, 1, 1], DataType::Float32)?;
-    let weights = graph.palettized_weights(&codes, 4, [outputs, inputs, 1, 1], &palette)?;
+    let weights = graph.palettized_weights(
+        &codes,
+        [outputs, inputs, 1, 1],
+        &Palettization::new(4, &palette),
+    )?;
     let output =
         graph.convolution_2d(&input, &weights, None, &Convolution2dDescriptor::default())?;
-    let mlir = graph.program(&[output], &[DataType::Float32])?.mlir()?;
-    assert!(mlir.contains("tensor<32x64x1x1xui4>"));
+    let mil = graph.program(&[output], &[DataType::Float32])?.mil()?;
+    assert!(mil.text.contains("indices = tensor<uint4, [32, 64, 1, 1]>"));
     let values: Vec<f32> = (0..inputs).map(|i| (i % 7) as f32 * 0.25 - 0.75).collect();
     let actual = evaluate(&graph, &[(input, &values)], output)?;
     for (row, actual) in actual.iter().enumerate() {
@@ -948,8 +765,8 @@ fn int8_weights_and_activations_with_channel_scales() -> Result<(), ane::Error> 
     )?;
     let scales = graph.constant(&channel_scales, [1, outputs, 1, 1])?;
     let output = graph.multiplication(&output, &scales)?;
-    let mlir = graph.program(&[output], &[DataType::Float32])?.mlir()?;
-    assert!(mlir.contains("tensor<32x64x1x1xsi8>"));
+    let mil = graph.program(&[output], &[DataType::Float32])?.mil()?;
+    assert!(mil.text.contains("tensor<int8, [32, 64, 1, 1]>"));
     let quantized: Vec<i32> = (0..inputs * tokens)
         .map(|i| (i * 13 % 201) as i32 - 100)
         .collect();
@@ -993,5 +810,547 @@ fn identical_constants_compile_once() -> Result<(), ane::Error> {
     let values: Vec<f32> = (0..65536).map(|i| (i % 7) as f32).collect();
     let actual = evaluate(&graph, &[(input, &values)], output)?;
     assert!(actual.iter().zip(&values).all(|(a, v)| *a == v * 0.25));
+    Ok(())
+}
+
+#[test]
+fn per_channel_constant_dequantization() -> Result<(), ane::Error> {
+    let (rows, columns) = (8, 64);
+    let codes: Vec<i8> = (0..rows * columns)
+        .map(|i| ((i * 37 % 255) as i32 - 127) as i8)
+        .collect();
+    let scales: Vec<f32> = (0..rows)
+        .map(|row| 1. / (1 << (row % 3 + 4)) as f32)
+        .collect();
+    let zeros: Vec<i32> = (0..rows as i32).map(|row| row - 4).collect();
+    let graph = Graph::new();
+    let input = graph.placeholder([rows, columns], DataType::Float32)?;
+    let bytes: Vec<u8> = codes.iter().map(|&code| code as u8).collect();
+    let weights = graph.constant_with_bytes(&bytes, [rows, columns], DataType::Int8)?;
+    let weights = graph.dequantize(&weights, &scales, Some(&zeros), Some(0))?;
+    let output = graph.multiplication(&weights, &input)?;
+    let actual = evaluate(&graph, &[(input, &[1.; 512])], output)?;
+    for (index, actual) in actual.iter().enumerate() {
+        let row = index / columns;
+        let expected = (codes[index] as i32 - zeros[row]) as f32 * scales[row];
+        assert_eq!(*actual, expected, "{index}");
+    }
+    Ok(())
+}
+
+#[test]
+fn attention_matches_reference_and_guards_float32_inputs() -> Result<(), ane::Error> {
+    let (heads, key_heads, rows, depth) = (4, 4, 8, 16);
+    let wave = |count: usize, step: usize| -> Vec<f32> {
+        (0..count)
+            .map(|i| ((i * step % 13) as f32 - 6.) * 0.05)
+            .collect()
+    };
+    let query = wave(heads * rows * depth, 7);
+    let key = wave(key_heads * rows * depth, 5);
+    let value = wave(key_heads * rows * depth, 3);
+    let graph = Graph::new();
+    let q = graph.placeholder([1, heads, rows, depth], DataType::Float32)?;
+    let k = graph.placeholder([1, key_heads, rows, depth], DataType::Float32)?;
+    let v = graph.placeholder([1, key_heads, rows, depth], DataType::Float32)?;
+    let output = graph.scaled_dot_product_attention(&q, &k, &v, None)?;
+    let half = CompilationDescriptor {
+        output_types: Some(vec![DataType::Float16]),
+        ..Default::default()
+    };
+    assert!(matches!(
+        graph.compile(&[output], &[], Some(&half)),
+        Err(ane::Error::Graph(ane::GraphError::UnsupportedComposition(
+            _
+        )))
+    ));
+    let graph = Graph::new();
+    let q = graph.placeholder([1, heads, rows, depth], DataType::Float16)?;
+    let k = graph.placeholder([1, key_heads, rows, depth], DataType::Float16)?;
+    let v = graph.placeholder([1, key_heads, rows, depth], DataType::Float16)?;
+    let output = graph.scaled_dot_product_attention(&q, &k, &v, None)?;
+    let executable = graph.compile(&[output], &[], Some(&half))?;
+    let data = executable
+        .feed_tensors()
+        .iter()
+        .map(|tensor| {
+            let data = executable.input(*tensor)?.allocate()?;
+            let values = [(q, &query), (k, &key), (v, &value)]
+                .into_iter()
+                .find(|(t, _)| t == tensor)
+                .unwrap()
+                .1;
+            data.copy_from_f32(values)?;
+            Ok(data)
+        })
+        .collect::<Result<Vec<_>, ane::Error>>()?;
+    let inputs: Vec<_> = data.iter().collect();
+    let actual = executable.run(&inputs, None, None)?[0].read_f32()?;
+    for head in 0..heads {
+        let shared = head / (heads / key_heads);
+        for row in 0..rows {
+            let scores: Vec<f32> = (0..rows)
+                .map(|column| {
+                    (0..depth)
+                        .map(|c| {
+                            query[(head * rows + row) * depth + c]
+                                * key[(shared * rows + column) * depth + c]
+                        })
+                        .sum::<f32>()
+                        / (depth as f32).sqrt()
+                })
+                .collect();
+            let peak = scores.iter().fold(f32::MIN, |a, &b| a.max(b));
+            let weights: Vec<f32> = scores.iter().map(|s| (s - peak).exp()).collect();
+            let total: f32 = weights.iter().sum();
+            for c in 0..depth {
+                let expected: f32 = (0..rows)
+                    .map(|column| {
+                        weights[column] / total * value[(shared * rows + column) * depth + c]
+                    })
+                    .sum();
+                let actual = actual[(head * rows + row) * depth + c];
+                assert!(
+                    (actual - expected).abs() < 2e-3,
+                    "{head},{row},{c}: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn pooling_and_index_lookups_match_reference_semantics() -> Result<(), ane::Error> {
+    let graph = Graph::new();
+    let input = graph.placeholder([1, 1, 5, 5], DataType::Float32)?;
+    let mut descriptor = Pooling2dDescriptor::new([2, 2], [2, 2]);
+    descriptor.padding = [1, 1, 1, 1];
+    let pooled = graph.max_pooling_2d(&input, &descriptor)?;
+    let image: Vec<f32> = (0..25).map(|v| v as f32).collect();
+    let expected: Vec<f32> = (0..3)
+        .flat_map(|i| (0..3).map(move |j| ((2 * i).min(4) * 5 + (2 * j).min(4)) as f32))
+        .collect();
+    assert_eq!(evaluate(&graph, &[(input, &image)], pooled)?, expected);
+
+    let graph = Graph::new();
+    let input = graph.placeholder([1, 1, 4, 4], DataType::Float32)?;
+    let mut corner = [0.; 9];
+    corner[0] = 1.;
+    let weights = graph.constant(&corner, [1, 1, 3, 3])?;
+    let descriptor = Convolution2dDescriptor {
+        strides: [2, 2],
+        pad_mode: PadMode::Same,
+        ..Default::default()
+    };
+    let same = graph.convolution_2d(&input, &weights, None, &descriptor)?;
+    let image: Vec<f32> = (0..16).map(|v| v as f32).collect();
+    assert_eq!(
+        evaluate(&graph, &[(input, &image)], same)?,
+        [0., 2., 8., 10.]
+    );
+
+    let graph = Graph::new();
+    let input = graph.placeholder([2, 4], DataType::Float32)?;
+    let positions = graph.placeholder([3], DataType::Float32)?;
+    let indices = graph.cast(&positions, DataType::UInt16)?;
+    let lookup = graph.gather(&input, &indices, -1)?;
+    let values: Vec<f32> = (0..8).map(|v| v as f32).collect();
+    assert_eq!(
+        evaluate(
+            &graph,
+            &[(input, &values), (positions, &[3., 0., 2.])],
+            lookup
+        )?,
+        [3., 0., 2., 7., 4., 6.]
+    );
+    Ok(())
+}
+
+#[test]
+fn submissions_keep_their_own_results() -> Result<(), ane::Error> {
+    let graph = Graph::new();
+    let input = graph.placeholder([64, 64], DataType::Float32)?;
+    let one = graph.constant(&[1.], [1])?;
+    let output = graph.addition(&input, &one)?;
+    let executable = graph.compile(&[output], &[], None)?;
+    let data = executable.input(input)?.allocate()?;
+    data.copy_from_f32(&[1.; 4096])?;
+    let outputs = executable.allocate_outputs()?;
+    let results: Vec<_> = outputs.iter().collect();
+    let first = executable.run_async(&[&data], Some(&results), None)?;
+    while !first.wait_timeout(std::time::Duration::from_secs(1)) {}
+    executable.run(&[&data], Some(&results), None)?;
+    assert!(first.is_finished());
+    first.wait()?;
+    let first = executable.run_async(&[&data], Some(&results), None)?;
+    while !first.is_finished() {
+        std::thread::yield_now();
+    }
+    data.copy_from_f32(&[2.; 4096])?;
+    let mut second = executable.run_async(&[&data], Some(&results), None)?;
+    first.wait()?;
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    let values = loop {
+        if let std::task::Poll::Ready(values) = std::pin::Pin::new(&mut second).poll(&mut context) {
+            break values?;
+        }
+        std::thread::yield_now();
+    };
+    assert!(values[0].read_f32()?.iter().all(|&v| v == 3.));
+    Ok(())
+}
+
+#[test]
+fn sparse_compressed_weights_decode_on_ane() -> Result<(), ane::Error> {
+    let (rows, columns) = (8, 16);
+    let count = rows * columns;
+    let mask: Vec<u8> = (0..count / 8).map(|i| [0x5a, 0xc3, 0x0f][i % 3]).collect();
+    let set: Vec<usize> = (0..count)
+        .filter(|&i| mask[i / 8] & (1 << (i % 8)) != 0)
+        .collect();
+    let palette: Vec<f32> = (0..16).map(|v| (v as f32 - 8.) * 0.25).collect();
+    let codes: Vec<u8> = (0..set.len()).map(|i| (i * 7 % 16) as u8).collect();
+    let packed: Vec<u8> = codes.chunks(2).map(|p| p[0] | (p[1] << 4)).collect();
+    let bytes: Vec<i8> = (0..set.len()).map(|i| (i * 37 % 255) as i8).collect();
+    let scales: Vec<f32> = (0..rows)
+        .map(|row| 1. / (1 << (row % 3 + 3)) as f32)
+        .collect();
+    let ones = vec![1.; count];
+    for palettized in [true, false] {
+        let graph = Graph::new();
+        let input = graph.placeholder([rows, columns], DataType::Float32)?;
+        let weights = if palettized {
+            graph.sparse_palettized_weights(&packed, &mask, 4, [rows, columns], &palette)?
+        } else {
+            let data: Vec<u8> = bytes.iter().map(|&v| v as u8).collect();
+            graph.sparse_blockwise_weights(
+                &data,
+                &mask,
+                [rows, columns],
+                &ane::BlockwiseQuantization {
+                    data_type: WeightDataType::Int8,
+                    scales: &scales,
+                    scale_shape: [rows, 1],
+                    offsets: None,
+                    zero_points: None,
+                },
+            )?
+        };
+        let output = graph.multiplication(&weights, &input)?;
+        let actual = evaluate(&graph, &[(input, &ones)], output)?;
+        let mut expected = vec![0.; count];
+        for (slot, &index) in set.iter().enumerate() {
+            expected[index] = if palettized {
+                palette[codes[slot] as usize]
+            } else {
+                bytes[slot] as f32 * scales[index / columns]
+            };
+        }
+        assert_eq!(actual, expected, "palettized {palettized}");
+    }
+    Ok(())
+}
+
+#[test]
+fn shared_executables_share_one_model_weights_and_variable() -> Result<(), ane::Error> {
+    let graph = Graph::new();
+    let half_identity: Vec<f32> = (0..4096)
+        .map(|i| if i / 64 == i % 64 { 0.5 } else { 0. })
+        .collect();
+    let weights = graph.constant(&half_identity, [64, 64])?;
+    let state = graph.variable_with_data(&[0.; 4096], [64, 64])?;
+    let input = graph.placeholder([64, 64], DataType::Float16)?;
+    let stored = graph.read_variable(&state)?;
+    let product = graph.matrix_multiplication(&input, &weights, false, false)?;
+    let accumulate = graph.assign_variable(&state, &graph.addition(&stored, &product)?)?;
+    let accumulated = graph.read_variable(&state)?;
+    let current = graph.read_variable(&state)?;
+    let projected = graph.matrix_multiplication(&current, &weights, false, false)?;
+    let one = graph.constant(&[1.], [1])?;
+    let increment = graph.assign_variable(&state, &graph.addition(&current, &one)?)?;
+    let incremented = graph.read_variable(&state)?;
+    let mut shared = graph.compile_shared(
+        &[
+            (&[accumulated], &[&accumulate]),
+            (&[projected], &[]),
+            (&[incremented], &[&increment]),
+        ],
+        None,
+    )?;
+    let (increment, project, accumulate) = (
+        shared.pop().unwrap(),
+        shared.pop().unwrap(),
+        shared.pop().unwrap(),
+    );
+    assert!(accumulate.report().mil_bytes < 2 * 4096 * 2);
+    assert!(project.feed_tensors().is_empty());
+    let ones = accumulate.input(input)?.allocate()?;
+    ones.copy_from_f32(&[1.; 4096])?;
+    let all = |data: &TensorData, expected: f32| -> Result<bool, ane::Error> {
+        Ok(data.read_f32()?.iter().all(|&v| v == expected))
+    };
+    assert!(all(&project.run(&[], None, None)?[0], 0.)?);
+    for expected in [0.5, 1.] {
+        assert!(all(&accumulate.run(&[&ones], None, None)?[0], expected)?);
+    }
+    assert!(all(&increment.run(&[], None, None)?[0], 2.)?);
+    assert!(all(&project.run(&[], None, None)?[0], 1.)?);
+    assert!(all(project.variable_data(&state)?, 2.)?);
+    Ok(())
+}
+
+fn fusion_weights(transposed: bool) -> Vec<f32> {
+    (0..256 * 256)
+        .map(|i| {
+            if transposed {
+                i % 256 * 256 + i / 256
+            } else {
+                i
+            }
+        })
+        .map(|i| ((i * 31 % 17) as f32 - 8.) / 256.)
+        .collect()
+}
+
+#[test]
+fn compiler_fuses_composed_ops_into_native_results() -> Result<(), ane::Error> {
+    type Build = fn(&Graph, &Tensor) -> Result<Tensor, ane::GraphError>;
+    let cases: [(&str, Build, Build); 5] = [
+        (
+            "layer_norm",
+            |g, x| {
+                let mean = g.reduction_mean(x, &[-1])?;
+                let centered = g.subtraction(x, &mean)?;
+                let squared = g.multiplication(&centered, &centered)?;
+                let variance = g.reduction_mean(&squared, &[-1])?;
+                g.multiplication(&centered, &g.reciprocal_square_root(&variance, 1e-5)?)
+            },
+            |g, x| g.layer_norm(x, &[-1], None, None, 1e-5),
+        ),
+        (
+            "silu",
+            |g, x| g.multiplication(x, &g.sigmoid(x)?),
+            |g, x| g.silu(x),
+        ),
+        (
+            "leaky_relu",
+            |g, x| g.maximum(x, &g.multiplication(x, &g.constant(&[0.1], [1])?)?),
+            |g, x| g.leaky_relu(x, 0.1),
+        ),
+        (
+            "linear",
+            |g, x| {
+                let w = g.constant(&fusion_weights(true), [256, 256])?;
+                let bias = g.constant(&[0.25; 256], [256])?;
+                g.addition(&g.matrix_multiplication(x, &w, false, false)?, &bias)
+            },
+            |g, x| {
+                let w = g.constant(&fusion_weights(false), [256, 256])?;
+                let bias = g.constant(&[0.25; 256], [256])?;
+                g.linear(x, &w, Some(&bias))
+            },
+        ),
+        (
+            "transposed_matmul",
+            |g, x| {
+                let w = g.constant(&fusion_weights(false), [256, 256])?;
+                g.matrix_multiplication(x, &g.transpose(&w, [1, 0])?, false, false)
+            },
+            |g, x| {
+                let w = g.constant(&fusion_weights(false), [256, 256])?;
+                g.matrix_multiplication(x, &w, false, true)
+            },
+        ),
+    ];
+    let values: Vec<f32> = (0..64 * 256)
+        .map(|i| ((i * 7919 % 1000) as f32 / 500. - 1.) * 4. + (i / 256) as f32 * 0.05)
+        .collect();
+    for (name, composed, native) in cases {
+        let [composed, native] = [composed, native].map(|build| {
+            let graph = Graph::new();
+            let x = graph.placeholder([64, 256], DataType::Float32)?;
+            let y = build(&graph, &x)?;
+            evaluate(&graph, &[(x, &values)], y)
+        });
+        let (composed, native) = (composed?, native?);
+        assert!(
+            composed
+                .iter()
+                .zip(&native)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{name}: the ANE compiler no longer fuses the composed form"
+        );
+    }
+    Ok(())
+}
+
+fn pack(codes: &[i32], bits: usize) -> Vec<u8> {
+    let mut packed = vec![0u8; (codes.len() * bits).div_ceil(8)];
+    for (index, &code) in codes.iter().enumerate() {
+        let bit = index * bits;
+        let code = (code as u32 & ((1 << bits) - 1)) << (bit % 8);
+        packed[bit / 8] |= code as u8;
+        if bit % 8 + bits > 8 {
+            packed[bit / 8 + 1] |= (code >> 8) as u8;
+        }
+    }
+    packed
+}
+
+#[test]
+fn integer_zero_points_dequantize_int4_and_int8_weights() -> Result<(), ane::Error> {
+    let (rows, columns, block) = (8, 64, 32);
+    for (data_type, bits, signed) in [
+        (WeightDataType::Int8, 8, true),
+        (WeightDataType::UInt8, 8, false),
+        (WeightDataType::Int4, 4, true),
+        (WeightDataType::UInt4, 4, false),
+    ] {
+        let low = if signed { -(1 << (bits - 1)) } else { 0 };
+        let code = |i: usize| low + (i * 37 % (1 << bits)) as i32;
+        let codes: Vec<i32> = (0..rows * columns).map(code).collect();
+        let blocks = rows * columns / block;
+        let zero_points: Vec<i32> = (0..blocks).map(|i| code(i * 11 + 5)).collect();
+        let scales: Vec<f32> = (0..blocks)
+            .map(|i| 1. / (1 << (i % 3 + 3)) as f32)
+            .collect();
+        let graph = Graph::new();
+        let input = graph.placeholder([rows, columns], DataType::Float32)?;
+        let weights = graph.blockwise_weights(
+            &pack(&codes, bits),
+            [rows, columns],
+            &BlockwiseQuantization {
+                zero_points: Some(&pack(&zero_points, bits)),
+                ..BlockwiseQuantization::new(data_type, &scales, [rows, columns / block])
+            },
+        )?;
+        let output = graph.multiplication(&weights, &input)?;
+        let actual = evaluate(&graph, &[(input, &vec![1.; rows * columns])], output)?;
+        let expected: Vec<f32> = (0..rows * columns)
+            .map(|i| {
+                let block = i / block;
+                (codes[i] - zero_points[block]) as f32 * scales[block]
+            })
+            .collect();
+        assert_eq!(actual, expected, "{data_type:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn quantized_and_vector_palettes_decode_on_ane() -> Result<(), ane::Error> {
+    let (rows, columns) = (4, 32);
+    let ones = vec![1.; rows * columns];
+    let indices: Vec<i32> = (0..rows * columns).map(|i| (i * 7 % 16) as i32).collect();
+
+    let codes: Vec<i32> = (0..32).map(|i| i * 9 % 256 - 128).collect();
+    let (scales, zero_points) = ([0.25f32, 0.125], [3, -5]);
+    let graph = Graph::new();
+    let input = graph.placeholder([rows, columns], DataType::Float32)?;
+    let weights = graph.palettized_weights(
+        &pack(&indices, 4),
+        [rows, columns],
+        &Palettization {
+            group_shape: [2, 1],
+            palette: ane::Palette::Quantized {
+                data_type: WeightDataType::Int8,
+                codes: &pack(&codes, 8),
+                scales: &scales,
+                zero_points: Some(&pack(&zero_points, 8)),
+            },
+            ..Palettization::new(4, &[])
+        },
+    )?;
+    let output = graph.multiplication(&weights, &input)?;
+    let actual = evaluate(&graph, &[(input, &ones)], output)?;
+    let expected: Vec<f32> = (0..rows * columns)
+        .map(|i| {
+            let group = i / columns / 2;
+            let code = codes[group * 16 + indices[i] as usize];
+            (code - zero_points[group]) as f32 * scales[group]
+        })
+        .collect();
+    assert_eq!(actual, expected, "int8 palette");
+
+    let palette: Vec<f32> = (0..32).map(|i| i as f32 * 0.5 - 4.).collect();
+    let vectors: Vec<i32> = indices[..rows * columns / 2].to_vec();
+    let graph = Graph::new();
+    let input = graph.placeholder([rows, columns], DataType::Float32)?;
+    let weights = graph.palettized_weights(
+        &pack(&vectors, 4),
+        [rows, columns],
+        &Palettization {
+            vector_axis: Some(1),
+            ..Palettization::new(4, &palette)
+        },
+    )?;
+    let output = graph.multiplication(&weights, &input)?;
+    let actual = evaluate(&graph, &[(input, &ones)], output)?;
+    let expected: Vec<f32> = (0..rows * columns)
+        .map(|i| {
+            let (row, column) = (i / columns, i % columns);
+            palette[vectors[row * columns / 2 + column / 2] as usize * 2 + column % 2]
+        })
+        .collect();
+    assert_eq!(actual, expected, "vector palette");
+    Ok(())
+}
+
+#[test]
+fn int8_activations_move_through_layout_ops() -> Result<(), ane::Error> {
+    let graph = Graph::new();
+    let input = graph.placeholder([16, 64], DataType::Float32)?;
+    let codes = graph.quantize(&input, &[0.125], None, None, DataType::Int8)?;
+    let transposed = graph.transpose(&codes, [1, 0])?;
+    let reshaped = graph.reshape(&transposed, [32, 32])?;
+    let sliced = graph.slice(&reshaped, [8, 0], [16, 32])?;
+    let output = graph.dequantize(&sliced, &[0.125], None, None)?;
+    let values: Vec<f32> = (0..16 * 64)
+        .map(|i| (i % 255) as f32 * 0.125 - 15.875)
+        .collect();
+    let actual = evaluate(&graph, &[(input, &values)], output)?;
+    let expected: Vec<f32> = (8 * 32..24 * 32)
+        .map(|i| {
+            let (row, column) = (i / 16, i % 16);
+            values[column * 64 + row]
+        })
+        .collect();
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
+fn purged_models_keep_running_and_recompile() -> Result<(), ane::Error> {
+    let graph = Graph::new();
+    let input = graph.placeholder([64, 64], DataType::Float32)?;
+    let offset = graph.constant(&[1.25], [1])?;
+    let output = graph.addition(&input, &offset)?;
+    let executable = graph.compile(&[output], &[], None)?;
+    let data = executable.input(input)?.allocate()?;
+    data.copy_from_f32(&[2.; 4096])?;
+    executable.purge_compiled_model()?;
+    let result = executable.run(&[&data], None, None)?;
+    assert!(result[0].read_f32()?.iter().all(|&v| v == 3.25));
+    let recompiled = graph.compile(&[output], &[], None)?;
+    let result = recompiled.run(&[&data], None, None)?;
+    assert!(result[0].read_f32()?.iter().all(|&v| v == 3.25));
+    Ok(())
+}
+
+#[test]
+fn compile_errors_carry_the_compiler_diagnostic() -> Result<(), ane::Error> {
+    let graph = Graph::new();
+    let input = graph.placeholder([4, 8], DataType::Float16)?;
+    let indices = graph.placeholder([3], DataType::UInt16)?;
+    let rows = graph.gather(&input, &indices, 0)?;
+    let message = graph.compile(&[rows], &[], None).err().unwrap().to_string();
+    let detail = message
+        .split_once("ANECCompile() FAILED: ")
+        .map(|(_, detail)| detail);
+    assert!(
+        detail.is_some_and(|detail| detail.contains("Layer")),
+        "{message}"
+    );
     Ok(())
 }

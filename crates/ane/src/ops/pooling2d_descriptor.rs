@@ -1,16 +1,24 @@
 use crate::PadMode;
 use crate::graph::{GraphError, checked_shape, ensure};
 
+/// Window geometry of 2-D pooling over the last two axes.
 #[derive(Clone, Debug)]
 pub struct Pooling2dDescriptor {
+    /// Window height and width.
     pub kernel: [usize; 2],
+    /// Vertical and horizontal stride.
     pub strides: [usize; 2],
+    /// Explicit `[top, bottom, left, right]` padding.
     pub padding: [usize; 4],
+    /// `Same` pads to `ceil(input / stride)` outputs; `Valid` uses `padding`.
     pub pad_mode: PadMode,
+    /// Rounds the output size up instead of down.
     pub ceil_mode: bool,
+    /// Average pooling divides by the unpadded window size.
     pub exclude_padding: bool,
 }
 impl Pooling2dDescriptor {
+    /// Unpadded windows of `kernel` moving by `strides`.
     pub fn new(kernel: [usize; 2], strides: [usize; 2]) -> Self {
         Self {
             kernel,
@@ -21,6 +29,7 @@ impl Pooling2dDescriptor {
             exclude_padding: false,
         }
     }
+    /// Output shape for an `[N, C, H, W]` input.
     pub fn output_shape(&self, input: [usize; 4]) -> Result<[usize; 4], GraphError> {
         checked_shape(&input)?;
         ensure(

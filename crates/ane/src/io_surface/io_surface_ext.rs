@@ -9,15 +9,17 @@ use objc2_io_surface::{
 
 use crate::io_surface::{IOSurfaceError, SurfaceLock};
 
-#[allow(
-    clippy::missing_safety_doc,
-    reason = "raw surface synchronization contract is in README"
-)]
 pub trait IOSurfaceExt {
     fn with_byte_count(byte_count: usize) -> Result<Retained<IOSurface>, IOSurfaceError>;
 
+    /// # Safety
+    ///
+    /// No other CPU, GPU or ANE user may access the surface during the copy.
     unsafe fn write_bytes(&self, data: &[u8]) -> Result<(), IOSurfaceError>;
 
+    /// # Safety
+    ///
+    /// No other CPU, GPU or ANE user may write the surface during the copy.
     unsafe fn read_bytes(&self, buffer: &mut [u8]) -> Result<(), IOSurfaceError>;
 }
 

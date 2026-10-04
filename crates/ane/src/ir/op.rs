@@ -33,13 +33,9 @@ impl Op {
             Self::Constant(_) => {}
             Self::StateUpdate(l) => [&mut l.bottom, &mut l.state, &mut l.position]
                 .into_iter()
-                .chain(l.previous.as_mut())
                 .for_each(swap),
             Self::StateRead(l) => swap(&mut l.state),
-            Self::StateWrite(l) => [&mut l.state, &mut l.bottom]
-                .into_iter()
-                .chain(l.previous.as_mut())
-                .for_each(swap),
+            Self::StateWrite(l) => [&mut l.state, &mut l.bottom].into_iter().for_each(swap),
             Self::Builtin(l) => l.inputs.iter_mut().for_each(|(_, tensor)| swap(tensor)),
         }
     }
@@ -59,7 +55,6 @@ impl Op {
                     && b.outputs.len() == 1
                     && shaped(a.outputs[0], b.outputs[0])
                     && a.operation == b.operation
-                    && a.logical == b.logical
                     && a.attributes == b.attributes
                     && a.blobs == b.blobs
             }
@@ -70,17 +65,9 @@ impl Op {
     pub fn bottoms(&self) -> Vec<Tensor> {
         match self {
             Self::Constant(_) => vec![],
-            Self::StateUpdate(l) => {
-                let mut tensors = vec![l.bottom, l.state, l.position];
-                tensors.extend(l.previous);
-                tensors
-            }
+            Self::StateUpdate(l) => vec![l.bottom, l.state, l.position],
             Self::StateRead(l) => vec![l.state],
-            Self::StateWrite(l) => {
-                let mut tensors = vec![l.state, l.bottom];
-                tensors.extend(l.previous);
-                tensors
-            }
+            Self::StateWrite(l) => vec![l.state, l.bottom],
             Self::Builtin(l) => l.inputs.iter().map(|&(_, tensor)| tensor).collect(),
         }
     }

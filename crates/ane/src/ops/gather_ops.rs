@@ -26,6 +26,8 @@ impl Graph {
         self.indices(indices)
     }
 
+    /// Slices of `input` at UInt16 `indices` along `axis`. The ANE runs it on the innermost axis only.
+    /// MIL `gather`.
     pub fn gather(
         &self,
         input: &Tensor,
@@ -39,11 +41,7 @@ impl Graph {
         shape.extend(indices.shape());
         shape.extend(&input.shape()[axis + 1..]);
         checked_shape(&shape)?;
-        let count = indices.shape().iter().product();
-        let indices = self.reshape_to(indices, &[count])?;
-        let mut flat_shape = input.shape().to_vec();
-        flat_shape[axis] = count;
-        let output = self.logical_builtin(
+        self.builtin(
             Operator::Gather,
             &[(Parameter::X, *input), (Parameter::Indices, indices)],
             &[
@@ -51,29 +49,13 @@ impl Graph {
                 (Parameter::BatchDims, Value::Int32(0)),
                 (Parameter::ValidateIndices, Value::Bool(false)),
             ],
-            &[(input.data_type(), &flat_shape)],
-        )?[0];
-        self.reshape_to(output, &shape)
+            &shape,
+            input.data_type(),
+        )
     }
 
-    pub fn one_hot(&self, indices: &Tensor, depth: usize) -> Result<Tensor, GraphError> {
-        self.indices(*indices)?;
-        ensure(
-            indices.rank() < 4 && (1..=2048).contains(&depth),
-            GraphError::InvalidArgument(
-                "one-hot requires indices below rank 4 and a depth of at most 2048",
-            ),
-        )?;
-        let values = self.cast(indices, DataType::Float16)?;
-        let mut shape = indices.shape().to_vec();
-        shape.push(1);
-        let values = self.reshape_to(values, &shape)?;
-        let classes: Vec<f32> = (0..depth).map(|class| class as f32).collect();
-        let classes = self.constant(&classes, [depth])?;
-        let hot = self.equal(&values, &classes)?;
-        self.cast(&hot, DataType::Float16)
-    }
-
+    /// Elements of `input` at UInt16 `indices` along `axis`; `indices` matches the input shape except
+    /// along `axis`. MIL `gather_along_axis`.
     pub fn gather_along_axis(
         &self,
         input: &Tensor,
@@ -100,26 +82,5 @@ impl Graph {
             indices.shape(),
             input.data_type(),
         )
-    }
-
-    pub fn gather_nd(&self, input: &Tensor, indices: &Tensor) -> Result<Tensor, GraphError> {
-        self.gather_operands(*input, *indices)?;
-        ensure(
-            indices.rank() > 0 && indices.physical_shape()[3] <= input.rank(),
-            GraphError::OutOfBounds("gather-ND index depth exceeds rank"),
-        )?;
-        let depth = indices.physical_shape()[3];
-        let mut shape = indices.shape()[..indices.rank() - 1].to_vec();
-        shape.extend(&input.shape()[depth..]);
-        checked_shape(&shape)?;
-        Ok(self.logical_builtin(
-            Operator::GatherNd,
-            &[(Parameter::X, *input), (Parameter::Indices, *indices)],
-            &[
-                (Parameter::BatchDims, Value::Int32(0)),
-                (Parameter::ValidateIndices, Value::Bool(false)),
-            ],
-            &[(input.data_type(), &shape)],
-        )?[0])
     }
 }

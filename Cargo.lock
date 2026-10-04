@@ -14,9 +14,6 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-io-surface",
- "objc2-metal",
- "objc2-metal-performance-shaders",
- "objc2-metal-performance-shaders-graph",
  "plist",
  "rand",
  "serde",
@@ -316,43 +313,6 @@ dependencies = [
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
-]
-
-[[package]]
-name = "objc2-metal"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0125f776a10d00af4152d74616409f0d4a2053a6f57fa5b7d6aa2854ac04794"
-dependencies = [
- "bitflags",
- "objc2",
- "objc2-foundation",
-]
-
-[[package]]
-name = "objc2-metal-performance-shaders"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46a10f15ff4e2045f947ffca8a17fc351b155c321de16f04278a008a1f446784"
-dependencies = [
- "bitflags",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
-]
-
-[[package]]
-name = "objc2-metal-performance-shaders-graph"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3733321d6edbaa799a59b3f2c82b9e83abfa7577eae0274d3c02f9e879eab1aa"
-dependencies = [
- "bitflags",
- "block2",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "objc2-metal-performance-shaders",
 ]
 
 [[package]]

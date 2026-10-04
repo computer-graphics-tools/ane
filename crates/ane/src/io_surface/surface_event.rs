@@ -4,11 +4,13 @@ use objc2::{rc::Retained, runtime::Bool};
 
 use obfstr::obfcstr;
 
+use crate::ensure_interfaces;
 use crate::io_surface::IOSurfaceError;
-use crate::unavailable_interface::ensure_interfaces;
 
 raw_class!(SurfaceEvent, c"IOSurfaceSharedEvent");
 
+// SAFETY: a shared event is a kernel-backed timeline built for cross-thread and cross-process
+// signaling; only its value accessors and waits are called.
 unsafe impl Send for SurfaceEvent {}
 unsafe impl Sync for SurfaceEvent {}
 

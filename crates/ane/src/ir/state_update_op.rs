@@ -5,7 +5,6 @@ pub struct StateUpdateOp {
     pub top: Tensor,
     pub bottom: Tensor,
     pub state: Tensor,
-    pub previous: Option<Tensor>,
     pub position: Tensor,
     pub rows: usize,
     pub channel: usize,

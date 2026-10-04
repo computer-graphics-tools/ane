@@ -5,10 +5,13 @@ use crate::graph::GraphBuilder;
 use crate::graph::Tensor;
 use crate::graph::TensorHandle;
 use crate::graph::{GraphError, checked_shape, ensure};
-use crate::ir::{Op, Operator, Parameter, Value};
+use crate::ir::{Operator, Parameter, Value};
 use crate::logical_shape;
 
 impl Graph {
+    /// `length` elements along `axis` from the runtime scalar Int32 `start`. The ANE takes dynamic
+    /// offsets only as scalar parameters, so the begin vector is assembled in the program.
+    /// MIL `slice_by_size`.
     pub fn slice_dynamic(
         &self,
         input: &Tensor,
@@ -31,41 +34,6 @@ impl Graph {
             GraphError::OutOfBounds("dynamic slice length exceeds its axis"),
         )?;
         shape[axis] = length;
-        let replacement = {
-            let state = self.state();
-            state.ops.iter().find_map(|(op, top)| {
-                if top != input {
-                    return None;
-                }
-                if let Op::StateUpdate(update) = op {
-                    (axis == 2
-                        && update.position == *start
-                        && update.rows == length
-                        && update.channel == 0
-                        && update.channels == shape[1])
-                        .then_some(update.bottom)
-                } else {
-                    None
-                }
-            })
-        };
-        if let Some(replacement) = replacement {
-            return self.reshape_to(replacement, &shape[4 - input.rank()..]);
-        }
-        let state = self.state();
-        let mut dependencies = std::collections::HashSet::from([*input]);
-        for (op, _) in state.ops.iter().rev() {
-            if op.tops().iter().any(|t| dependencies.contains(t)) {
-                ensure(
-                    !matches!(op, Op::StateUpdate(_)),
-                    GraphError::UnsupportedComposition(
-                        "slice cached data before updating it, or read it in a subsequent execution",
-                    ),
-                )?;
-                dependencies.extend(op.bottoms());
-            }
-        }
-        drop(state);
         self.builtin(
             Operator::DynamicSlice,
             &[(Parameter::X, *input), (Parameter::Begin, *start)],
@@ -77,20 +45,16 @@ impl Graph {
             input.data_type(),
         )
     }
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "preserves the existing public padding API"
-    )]
+    /// Pads the last two axes by `[top, bottom, left, right]` in constant, reflect or replicate mode;
+    /// MIL has no symmetric mode. MIL `pad`.
     pub fn pad(
         &self,
         input: &Tensor,
-        top: usize,
-        bottom: usize,
-        left: usize,
-        right: usize,
+        padding: [usize; 4],
         mode: PadFillMode,
-        value: f64,
+        value: f32,
     ) -> Result<Tensor, GraphError> {
+        let [top, bottom, left, right] = padding;
         let input = *input;
         self.numeric(input)?;
         ensure(
@@ -115,18 +79,20 @@ impl Graph {
         if [top, bottom, left, right] == [0; 4] {
             return Ok(input);
         }
-        let margin = match mode {
-            PadFillMode::Reflect => Some(1),
-            PadFillMode::Symmetric => Some(0),
-            PadFillMode::Constant | PadFillMode::Replicate => None,
+        let mode = match mode {
+            PadFillMode::Constant => "constant",
+            PadFillMode::Reflect => "reflect",
+            PadFillMode::Replicate => "replicate",
+            PadFillMode::Symmetric => {
+                return Err(GraphError::InvalidArgument(
+                    "MIL pad supports constant, reflect and replicate modes",
+                ));
+            }
         };
-        if let Some(margin) = margin {
+        if mode == "reflect" {
             let [_, _, rows, columns] = input.physical_shape();
             ensure(
-                top + margin <= rows
-                    && bottom + margin <= rows
-                    && left + margin <= columns
-                    && right + margin <= columns,
+                top < rows && bottom < rows && left < columns && right < columns,
                 GraphError::OutOfBounds("mirrored padding exceeds input"),
             )?;
         }
@@ -136,12 +102,6 @@ impl Graph {
             height,
             width,
         ];
-        let mode = match mode {
-            PadFillMode::Constant => "constant",
-            PadFillMode::Reflect => "reflect",
-            PadFillMode::Symmetric => "symmetric",
-            PadFillMode::Replicate => "replicate",
-        };
         self.builtin(
             Operator::Pad,
             &[(Parameter::X, input)],
@@ -151,13 +111,14 @@ impl Graph {
                     Value::int32_list(&[top, bottom, left, right]),
                 ),
                 (Parameter::Mode, Value::String(mode)),
-                (Parameter::ConstantVal, Value::Fp16(value as f32)),
+                (Parameter::ConstantVal, Value::Fp16(value)),
             ],
             &shape[4 - input.rank()..],
             DataType::Float16,
         )
     }
 
+    /// Converts to `dtype`; float to integer rounds half away from zero. MIL `cast`.
     pub fn cast(&self, x: &Tensor, dtype: DataType) -> Result<Tensor, GraphError> {
         ensure(
             dtype != DataType::Int32 && dtype != DataType::Float32,
@@ -174,6 +135,7 @@ impl Graph {
         )
     }
 
+    /// Reshapes without moving data. MIL `reshape`.
     pub fn reshape<const RANK: usize>(
         &self,
         input: &Tensor,
@@ -182,11 +144,7 @@ impl Graph {
         self.reshape_to(*input, logical_shape(&shape))
     }
 
-    pub fn reshape_like(&self, input: &Tensor, other: &Tensor) -> Result<Tensor, GraphError> {
-        self.check_tensor(*other)?;
-        self.reshape_to(*input, other.shape())
-    }
-
+    /// Permutes the axes. MIL `transpose`.
     pub fn transpose(
         &self,
         input: &Tensor,
@@ -219,6 +177,7 @@ impl Graph {
         )
     }
 
+    /// Static slice of `size` elements from `begin`. MIL `slice_by_size`.
     pub fn slice(
         &self,
         input: &Tensor,
@@ -254,47 +213,55 @@ impl Graph {
         )
     }
 
+    /// Static slice of `[begin, end)` with `stride`. MIL `slice_by_index`.
     pub fn strided_slice(
         &self,
         input: &Tensor,
         begin: &[usize],
-        size: &[usize],
-        strides: &[usize],
+        end: &[usize],
+        stride: &[usize],
     ) -> Result<Tensor, GraphError> {
+        self.check_tensor(*input)?;
+        let rank = input.rank();
         ensure(
-            size.len() == strides.len(),
-            GraphError::ShapeMismatch("slice stride rank differs"),
+            begin.len() == rank && end.len() == rank && stride.len() == rank,
+            GraphError::ShapeMismatch("slice_by_index rank differs"),
         )?;
-        checked_shape(size)?;
-        let stride = checked_shape(strides)?;
-        let span = size
-            .iter()
-            .zip(strides)
-            .map(|(&n, &s)| {
-                (n - 1)
-                    .checked_mul(s)
-                    .and_then(|n| n.checked_add(1))
-                    .ok_or(GraphError::Overflow)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let source = self.slice(input, begin, &span)?;
+        let (mut first, mut last, mut step) = ([0; 4], input.physical_shape(), [1; 4]);
+        first[4 - rank..].copy_from_slice(begin);
+        last[4 - rank..].copy_from_slice(end);
+        step[4 - rank..].copy_from_slice(stride);
+        ensure(
+            (0..4)
+                .all(|a| first[a] < last[a] && last[a] <= input.physical_shape()[a] && step[a] > 0),
+            GraphError::OutOfBounds("slice_by_index exceeds tensor"),
+        )?;
+        let shape: Vec<_> = (0..4)
+            .map(|a| (last[a] - first[a]).div_ceil(step[a]))
+            .collect();
         self.builtin(
             Operator::SliceByIndex,
-            &[(Parameter::X, source)],
+            &[(Parameter::X, *input)],
             &[
-                (Parameter::Begin, Value::int32_list(&[0; 4])),
-                (Parameter::End, Value::int32_list(&checked_shape(&span)?)),
-                (Parameter::Stride, Value::int32_list(&stride)),
+                (Parameter::Begin, Value::int32_list(&first)),
+                (Parameter::End, Value::int32_list(&last)),
+                (Parameter::Stride, Value::int32_list(&step)),
                 (Parameter::BeginMask, Value::BoolList([false; 4].into())),
                 (Parameter::EndMask, Value::BoolList([false; 4].into())),
                 (Parameter::SqueezeMask, Value::BoolList([false; 4].into())),
             ],
-            size,
+            &shape[4 - rank..],
             input.data_type(),
         )
     }
 
-    pub fn concat(&self, inputs: &[&Tensor], axis: usize) -> Result<Tensor, GraphError> {
+    /// Concatenates along `axis`, or interleaves elements when `interleave` is set. MIL `concat`.
+    pub fn concat(
+        &self,
+        inputs: &[&Tensor],
+        axis: usize,
+        interleave: bool,
+    ) -> Result<Tensor, GraphError> {
         let inputs: Vec<Tensor> = inputs.iter().map(|&&tensor| tensor).collect();
         let inputs = &inputs[..];
         ensure(
@@ -319,22 +286,20 @@ impl Graph {
                 .checked_add(input.physical_shape()[physical_axis])
                 .ok_or(GraphError::Overflow)?;
         }
-        if inputs.len() == 1 {
-            return self.identity(&first);
-        }
         let values: Vec<_> = inputs.iter().map(|&t| (Parameter::Values, t)).collect();
         self.builtin(
             Operator::Concat,
             &values,
             &[
                 (Parameter::Axis, Value::Int32(physical_axis)),
-                (Parameter::Interleave, Value::Bool(false)),
+                (Parameter::Interleave, Value::Bool(interleave)),
             ],
             &shape[4 - first.rank()..],
             first.data_type(),
         )
     }
 
+    /// Splits along `axis` into pieces of `sizes`. MIL `split`.
     pub fn split(
         &self,
         input: &Tensor,
@@ -353,32 +318,30 @@ impl Graph {
             sum == input.physical_shape()[physical],
             GraphError::ShapeMismatch("split sizes differ from axis length"),
         )?;
-        let mut begin = vec![0; input.rank()];
-        let mut shape = input.shape().to_vec();
-        let mut outputs = Vec::new();
-        for &size in sizes {
-            shape[axis] = size;
-            outputs.push(self.slice(input, &begin, &shape)?);
-            begin[axis] += size;
-        }
-        Ok(outputs)
-    }
-
-    pub fn flatten_2d(&self, input: &Tensor, axis: usize) -> Result<Tensor, GraphError> {
-        self.check_tensor(*input)?;
-        ensure(
-            axis <= input.rank(),
-            GraphError::InvalidAxes("flatten axis exceeds rank"),
-        )?;
-        self.reshape_to(
-            *input,
+        let shapes: Vec<Vec<usize>> = sizes
+            .iter()
+            .map(|&size| {
+                let mut shape = input.shape().to_vec();
+                shape[axis] = size;
+                shape
+            })
+            .collect();
+        let outputs: Vec<_> = shapes
+            .iter()
+            .map(|shape| (input.data_type(), &shape[..]))
+            .collect();
+        self.builtin_many(
+            Operator::Split,
+            &[(Parameter::X, *input)],
             &[
-                input.shape()[..axis].iter().product(),
-                input.shape()[axis..].iter().product(),
+                (Parameter::SplitSizes, Value::int32_list(sizes)),
+                (Parameter::Axis, Value::Int32(physical)),
             ],
+            &outputs,
         )
     }
 
+    /// Inserts size-1 axes at `axes`. MIL `reshape`.
     pub fn expand_dims(&self, input: &Tensor, axes: &[usize]) -> Result<Tensor, GraphError> {
         self.check_tensor(*input)?;
         let mut axes = axes.to_vec();
@@ -395,6 +358,7 @@ impl Graph {
         self.reshape_to(*input, &shape)
     }
 
+    /// Removes the size-1 axes at `axes`. MIL `reshape`.
     pub fn squeeze(&self, input: &Tensor, axes: &[usize]) -> Result<Tensor, GraphError> {
         let input = *input;
         self.check_tensor(input)?;
@@ -421,20 +385,7 @@ impl Graph {
         self.reshape_to(input, &shape)
     }
 
-    pub fn stack(&self, inputs: &[&Tensor], axis: usize) -> Result<Tensor, GraphError> {
-        let inputs: Vec<Tensor> = inputs.iter().map(|&&tensor| tensor).collect();
-        let inputs = &inputs[..];
-        ensure(
-            !inputs.is_empty(),
-            GraphError::InvalidArgument("stack requires inputs"),
-        )?;
-        let mut expanded = Vec::new();
-        for &input in inputs {
-            expanded.push(self.expand_dims(&input, &[axis])?);
-        }
-        self.concat(&expanded.iter().collect::<Vec<_>>(), axis)
-    }
-
+    /// Repeats the tensor `repeats` times along every axis. MIL `tile`.
     pub fn tile(&self, input: &Tensor, repeats: &[usize]) -> Result<Tensor, GraphError> {
         let input = *input;
         self.check_tensor(input)?;
@@ -458,31 +409,7 @@ impl Graph {
         )
     }
 
-    pub fn broadcast_to<const RANK: usize>(
-        &self,
-        input: &Tensor,
-        shape: [usize; RANK],
-    ) -> Result<Tensor, GraphError> {
-        let input = *input;
-        self.check_tensor(input)?;
-        let shape = logical_shape(&shape);
-        let target = checked_shape(shape)?;
-        ensure(
-            shape.len() >= input.rank()
-                && (0..4).all(|a| {
-                    input.physical_shape()[a] == 1 || input.physical_shape()[a] == target[a]
-                }),
-            GraphError::ShapeMismatch("incompatible broadcast target"),
-        )?;
-        let expanded = self.reshape_to(input, &input.physical_shape()[4 - shape.len()..])?;
-        let repeats: Vec<_> = shape
-            .iter()
-            .enumerate()
-            .map(|(a, &n)| n / expanded.shape()[a])
-            .collect();
-        self.tile(&expanded, &repeats)
-    }
-
+    /// Reverses the order along `axes`. MIL `reverse`.
     pub fn reverse(&self, input: &Tensor, axes: &[i64]) -> Result<Tensor, GraphError> {
         let input = *input;
         let axes = axes
@@ -502,6 +429,8 @@ impl Graph {
         )
     }
 
+    /// Writes `update` into `input` at `begin`. The ANE compiles it only when the update spans whole
+    /// planes along the channel axis. MIL `slice_update`.
     pub fn slice_update(
         &self,
         input: &Tensor,
@@ -526,49 +455,19 @@ impl Graph {
         )?;
         let mut start = [0; 4];
         start[4 - input.rank()..].copy_from_slice(begin);
-        let source = self.reshape_to(input, &input.physical_shape())?;
-        let patch = self.reshape_to(update, &update.physical_shape())?;
-        let result = self.embed(source, patch, start, 0)?;
-        self.reshape_to(result, input.shape())
-    }
-
-    fn embed(
-        &self,
-        source: Tensor,
-        patch: Tensor,
-        start: [usize; 4],
-        axis: usize,
-    ) -> Result<Tensor, GraphError> {
-        if axis == 4 {
-            return Ok(patch);
-        }
-        let full = source.physical_shape();
-        let (begin, length) = (start[axis], patch.physical_shape()[axis]);
-        let window = |offset: usize, size: usize| {
-            let mut origin = [0; 4];
-            let mut extent = full;
-            origin[axis] = offset;
-            extent[axis] = size;
-            self.slice(&source, origin, extent)
-        };
-        let middle = if length == full[axis] {
-            source
-        } else {
-            window(begin, length)?
-        };
-        let middle = self.embed(middle, patch, start, axis + 1)?;
-        let mut parts = Vec::new();
-        if begin > 0 {
-            parts.push(window(0, begin)?);
-        }
-        parts.push(middle);
-        if begin + length < full[axis] {
-            parts.push(window(begin + length, full[axis] - begin - length)?);
-        }
-        if parts.len() == 1 {
-            return Ok(middle);
-        }
-        self.concat(&parts.iter().collect::<Vec<_>>(), axis)
+        let end: Vec<_> = (0..4)
+            .map(|a| start[a] + update.physical_shape()[a])
+            .collect();
+        self.builtin(
+            Operator::SliceUpdate,
+            &[(Parameter::X, input), (Parameter::Update, update)],
+            &[
+                (Parameter::Begin, Value::int32_list(&start)),
+                (Parameter::End, Value::int32_list(&end)),
+            ],
+            input.shape(),
+            input.data_type(),
+        )
     }
 
     fn spatial_shuffle(
@@ -604,9 +503,8 @@ impl Graph {
         }
         let (op, key) = match (inverse, pixel) {
             (false, false) => (Operator::DepthToSpace, Parameter::BlockSize),
-            (true, false) => (Operator::SpaceToDepth, Parameter::BlockSize),
+            (true, _) => (Operator::SpaceToDepth, Parameter::BlockSize),
             (false, true) => (Operator::PixelShuffle, Parameter::UpscaleFactor),
-            (true, true) => (Operator::PixelUnshuffle, Parameter::DownscaleFactor),
         };
         self.builtin(
             op,
@@ -617,22 +515,25 @@ impl Graph {
         )
     }
 
+    /// Moves channel blocks into `factor × factor` spatial blocks in TensorFlow order: output channel
+    /// `c` at offset `(dy, dx)` comes from input channel `(dy · factor + dx) · C + c`. MIL `depth_to_space`.
     pub fn depth_to_space(&self, input: &Tensor, factor: usize) -> Result<Tensor, GraphError> {
         self.spatial_shuffle(*input, factor, false, false)
     }
 
+    /// Inverse of `depth_to_space`, in the same TensorFlow channel order. MIL `space_to_depth`.
     pub fn space_to_depth(&self, input: &Tensor, factor: usize) -> Result<Tensor, GraphError> {
         self.spatial_shuffle(*input, factor, true, false)
     }
 
+    /// `depth_to_space` in PyTorch order: output channel `c` at offset `(dy, dx)` comes from input
+    /// channel `c · factor² + dy · factor + dx`. MIL `pixel_shuffle`.
     pub fn pixel_shuffle(&self, input: &Tensor, factor: usize) -> Result<Tensor, GraphError> {
         self.spatial_shuffle(*input, factor, false, true)
     }
 
-    pub fn pixel_unshuffle(&self, input: &Tensor, factor: usize) -> Result<Tensor, GraphError> {
-        self.spatial_shuffle(*input, factor, true, true)
-    }
-
+    /// Pads the last two axes by `padding` and moves `block` spatial blocks into the batch axis.
+    /// MIL `space_to_batch`.
     pub fn space_to_batch(
         &self,
         input: &Tensor,
@@ -658,29 +559,28 @@ impl Graph {
             GraphError::ShapeMismatch("padded spatial dimensions must divide by block size"),
         )?;
         let [batches, channels, ..] = input.physical_shape();
-        let padded = self.pad(
-            &input,
-            padding[0],
-            padding[1],
-            padding[2],
-            padding[3],
-            PadFillMode::Constant,
-            0.0,
-        )?;
-        let mut blocks = Vec::with_capacity(block[0] * block[1]);
-        for row in 0..block[0] {
-            for column in 0..block[1] {
-                blocks.push(self.strided_slice(
-                    &padded,
-                    &[0, 0, row, column],
-                    &[batches, channels, h / block[0], w / block[1]],
-                    &[1, 1, block[0], block[1]],
-                )?);
-            }
-        }
-        self.concat(&blocks.iter().collect::<Vec<_>>(), 0)
+        let factor = block[0].checked_mul(block[1]).ok_or(GraphError::Overflow)?;
+        self.builtin(
+            Operator::SpaceToBatch,
+            &[(Parameter::X, input)],
+            &[
+                (Parameter::BlockShape, Value::int32_list(&block)),
+                (
+                    Parameter::Paddings,
+                    Value::Int32Matrix([[padding[0], padding[1]], [padding[2], padding[3]]]),
+                ),
+            ],
+            &[
+                batches.checked_mul(factor).ok_or(GraphError::Overflow)?,
+                channels,
+                h / block[0],
+                w / block[1],
+            ],
+            input.data_type(),
+        )
     }
 
+    /// Inverse of `space_to_batch`, cropping by `crops`. MIL `batch_to_space`.
     pub fn batch_to_space(
         &self,
         input: &Tensor,
@@ -726,29 +626,5 @@ impl Graph {
             ],
             input.data_type(),
         )
-    }
-
-    pub fn crop(&self, input: &Tensor, borders: [usize; 4]) -> Result<Tensor, GraphError> {
-        let input = *input;
-        self.check_tensor(input)?;
-        ensure(
-            input.rank() >= 2,
-            GraphError::ShapeMismatch("crop requires spatial dimensions"),
-        )?;
-        let h = input.physical_shape()[2]
-            .checked_sub(borders[0])
-            .and_then(|n| n.checked_sub(borders[1]))
-            .ok_or(GraphError::OutOfBounds("crop exceeds height"))?;
-        let w = input.physical_shape()[3]
-            .checked_sub(borders[2])
-            .and_then(|n| n.checked_sub(borders[3]))
-            .ok_or(GraphError::OutOfBounds("crop exceeds width"))?;
-        let mut begin = vec![0; input.rank()];
-        let mut size = input.shape().to_vec();
-        begin[input.rank() - 2] = borders[0];
-        begin[input.rank() - 1] = borders[2];
-        size[input.rank() - 2] = h;
-        size[input.rank() - 1] = w;
-        self.slice(&input, begin, size)
     }
 }

@@ -1,17 +1,25 @@
 use crate::PadMode;
 use crate::graph::{GraphError, checked_shape, ensure};
 
+/// Geometry of a transposed 2-D convolution.
 #[derive(Clone, Debug)]
 pub struct ConvolutionTranspose2dDescriptor {
+    /// Channel groups.
     pub groups: usize,
+    /// Vertical and horizontal stride.
     pub strides: [usize; 2],
+    /// Vertical and horizontal kernel dilation.
     pub dilations: [usize; 2],
+    /// `[top, bottom, left, right]` cropped from the full output.
     pub padding: [usize; 4],
+    /// Extra rows and columns added to the bottom and right.
     pub output_padding: [usize; 2],
+    /// `Same` produces `input · stride` outputs; `Valid` uses `padding`.
     pub pad_mode: PadMode,
 }
 
 impl ConvolutionTranspose2dDescriptor {
+    /// Output shape for an `[N, Cin, H, W]` input and `[Cin, Cout / groups, kH, kW]` weights.
     pub fn output_shape(
         &self,
         input: [usize; 4],

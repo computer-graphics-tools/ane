@@ -6,7 +6,6 @@ pub enum Value {
     Bool(bool),
     Int32(usize),
     Fp16(f32),
-    Fp32(f32),
     String(&'static str),
     Integer(DataType, i32),
     Int32List(Box<[usize]>),
@@ -17,15 +16,6 @@ pub enum Value {
 }
 
 impl Value {
-    pub fn heap_bytes(&self) -> usize {
-        match self {
-            Self::Int32List(v) => std::mem::size_of_val(&**v),
-            Self::BoolList(v) => std::mem::size_of_val(&**v),
-            Self::Fp16List(v) => std::mem::size_of_val(&**v),
-            Self::IntegerList(_, v) => std::mem::size_of_val(&**v),
-            _ => 0,
-        }
-    }
     pub fn int32_list(values: &[usize]) -> Self {
         Self::Int32List(values.into())
     }
@@ -47,7 +37,6 @@ impl Value {
             Self::Int32Matrix(v) => (v.iter().flatten().all(int), "int32"),
             Self::Fp16(v) => (fp16(v), "fp16"),
             Self::Fp16List(v) => (v.iter().all(fp16), "fp16"),
-            Self::Fp32(v) => (fp16(v), "fp32"),
             Self::Integer(dtype, v) => (integer(*dtype, *v), dtype.as_str()),
             Self::IntegerList(dtype, v) => (v.iter().all(|v| integer(*dtype, *v)), dtype.as_str()),
             Self::String(v) => (

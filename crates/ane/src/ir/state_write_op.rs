@@ -4,6 +4,5 @@ use crate::graph::Tensor;
 pub struct StateWriteOp {
     pub top: Tensor,
     pub state: Tensor,
-    pub previous: Option<Tensor>,
     pub bottom: Tensor,
 }
