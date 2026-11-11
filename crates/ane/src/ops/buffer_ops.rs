@@ -1,3 +1,4 @@
+use crate::core::BUFFER_ROW_ALIGNMENT;
 use crate::graph::{Graph, GraphBuilder, GraphError, Tensor, TensorHandle, checked_shape, ensure};
 use crate::ir::{Operator, Parameter, Value};
 use crate::{DataType, logical_shape, row_strides};
@@ -22,7 +23,7 @@ fn buffer_strides(
         .checked_mul(data_type.byte_width())
         .ok_or(GraphError::Overflow)?;
     ensure(
-        row_bytes.is_multiple_of(64),
+        row_bytes.is_multiple_of(BUFFER_ROW_ALIGNMENT),
         GraphError::InvalidArgument(
             "buffer rows must be 64-byte aligned (see DataType::aligned_row_stride)",
         ),
