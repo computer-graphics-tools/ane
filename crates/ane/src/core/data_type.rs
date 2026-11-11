@@ -30,6 +30,11 @@ impl DataType {
         }
     }
 
+    /// Row stride in elements, padded to 64-byte alignment.
+    pub const fn aligned_row_stride(self, width: usize) -> usize {
+        (width * self.byte_width()).next_multiple_of(64) / self.byte_width()
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Float32 => "fp32",

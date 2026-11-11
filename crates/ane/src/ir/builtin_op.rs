@@ -184,6 +184,7 @@ impl BuiltinOp {
             O::Select => input(P::A).unwrap().data_type(),
             O::Cast | O::Quantize => output.data_type(),
             O::Reshape
+            | O::TensorToTensorBuffer
             | O::Transpose
             | O::SliceBySize
             | O::SliceByIndex
@@ -220,6 +221,13 @@ impl BuiltinOp {
                         == 1
                         && output.physical_shape() == shape,
                 )
+            }
+            O::TensorToTensorBuffer => {
+                let x = input(P::X).unwrap();
+                let Some(Value::Int32List(strides)) = attr(P::Strides) else {
+                    unreachable!()
+                };
+                require(x.physical_shape() == output.physical_shape() && strides.len() == 4)
             }
             O::Matmul => {
                 let x = input(P::X).unwrap();

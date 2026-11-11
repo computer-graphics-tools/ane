@@ -22,6 +22,8 @@ pub enum TensorDataError {
     NotContiguousFloat32,
     #[error("strides {0:?} overlap or do not match the element size")]
     InvalidStrides([usize; 4]),
+    #[error("tensor row layout overflows the address space")]
+    LayoutOverflow,
     #[error("{available}-byte allocation does not cover {required} bytes")]
     AllocationTooSmall { required: usize, available: usize },
     #[error("surface is not aligned for {0:?} elements")]

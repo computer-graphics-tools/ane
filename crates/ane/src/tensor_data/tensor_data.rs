@@ -1,6 +1,8 @@
-use std::ptr;
+use std::ffi::c_void;
+use std::ptr::{self, NonNull};
 
 use half::f16;
+use objc2::Message;
 use objc2::rc::Retained;
 use objc2_io_surface::IOSurface;
 
@@ -45,9 +47,7 @@ impl TensorData {
     }
     /// # Safety
     ///
-    /// External CPU, GPU and device users of the surface must be synchronized with this crate,
-    /// the surface allocation must stay at least as large as the layout, and every element
-    /// that is read must be initialized.
+    /// Same requirements as [`Self::from_layout`].
     pub unsafe fn from_surface<const RANK: usize>(
         surface: Retained<IOSurface>,
         shape: [usize; RANK],
@@ -57,9 +57,8 @@ impl TensorData {
     }
     /// # Safety
     ///
-    /// External CPU, GPU and device users of the surface must be synchronized with this crate,
-    /// the surface allocation must stay at least as large as the layout, and every element
-    /// that is read must be initialized.
+    /// Synchronize external CPU/GPU/device access with this crate. Keep the allocation
+    /// large enough for `spec`, and initialize every element before reading it.
     pub unsafe fn from_layout(
         surface: Retained<IOSurface>,
         spec: TensorSpec,
@@ -76,6 +75,14 @@ impl TensorData {
             return Err(TensorDataError::Misaligned(spec.data_type()));
         }
         Ok(Self { surface, spec })
+    }
+    /// Views the same surface using `spec`, without copying.
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as [`Self::from_layout`].
+    pub unsafe fn view_as(&self, spec: &TensorSpec) -> Result<Self, TensorDataError> {
+        unsafe { Self::from_layout(self.surface.retain(), spec.clone()) }
     }
     pub fn copy_from_f32(&self, data: &[f32]) -> Result<(), TensorDataError> {
         self.expect_length(data.len())?;
@@ -153,6 +160,16 @@ impl TensorData {
     }
     pub fn surface(&self) -> &IOSurface {
         &self.surface
+    }
+    pub fn allocation_size(&self) -> usize {
+        self.surface.allocationSize() as usize
+    }
+    /// Pointer valid while `self` lives; access must be synchronized.
+    pub fn base_address(&self) -> NonNull<c_void> {
+        self.surface.baseAddress()
+    }
+    pub fn row_stride_bytes(&self) -> usize {
+        self.spec.strides()[2]
     }
 
     fn expect_data_type(&self, actual: DataType) -> Result<(), TensorDataError> {

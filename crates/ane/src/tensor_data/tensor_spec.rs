@@ -2,7 +2,7 @@ use objc2_io_surface::IOSurface;
 
 use crate::io_surface::IOSurfaceExt;
 use crate::tensor_data::{TensorData, TensorDataError};
-use crate::{DataType, padded_shape};
+use crate::{DataType, padded_shape, row_strides};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TensorSpec {
@@ -20,11 +20,7 @@ impl TensorSpec {
         dtype: DataType,
     ) -> Result<Self, TensorDataError> {
         let physical = checked_shape(shape)?;
-        let mut strides = [dtype.byte_width(); 4];
-        for axis in (0..3).rev() {
-            strides[axis] = strides[axis + 1] * physical[axis + 1];
-        }
-        let bytes = strides[0] * physical[0];
+        let (strides, bytes) = checked_row_layout(&physical, dtype, physical[3])?;
         Ok(Self {
             name: name.into(),
             shape: shape.into(),
@@ -62,6 +58,13 @@ impl TensorSpec {
         self.strides = strides;
         self.bytes = bytes;
         Ok(self)
+    }
+
+    /// Sets the distance between row starts, in elements.
+    pub fn with_row_stride(self, row_stride: usize) -> Result<Self, TensorDataError> {
+        let physical = checked_shape(&self.shape)?;
+        let (strides, bytes) = checked_row_layout(&physical, self.dtype, row_stride)?;
+        self.with_layout(strides, bytes)
     }
 
     pub fn with_shape(mut self, shape: &[usize]) -> Result<Self, TensorDataError> {
@@ -144,6 +147,25 @@ impl TensorSpec {
             )
         }
     }
+}
+
+fn checked_row_layout(
+    shape: &[usize; 4],
+    dtype: DataType,
+    row_stride: usize,
+) -> Result<([usize; 4], usize), TensorDataError> {
+    let element_strides = row_strides(shape, row_stride).ok_or(TensorDataError::LayoutOverflow)?;
+    let byte_width = dtype.byte_width();
+    let mut strides = [0; 4];
+    for (stride, element_stride) in strides.iter_mut().zip(element_strides) {
+        *stride = element_stride
+            .checked_mul(byte_width)
+            .ok_or(TensorDataError::LayoutOverflow)?;
+    }
+    let bytes = strides[0]
+        .checked_mul(shape[0])
+        .ok_or(TensorDataError::LayoutOverflow)?;
+    Ok((strides, bytes))
 }
 
 fn checked_shape(shape: &[usize]) -> Result<[usize; 4], TensorDataError> {

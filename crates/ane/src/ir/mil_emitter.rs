@@ -22,6 +22,7 @@ pub struct MilEmitter {
     states: HashSet<Tensor>,
     constants: HashMap<Tensor, WeightBlob>,
     produced: HashSet<String>,
+    buffers: HashSet<String>,
     weights: WeightFile,
     next: usize,
 }
@@ -71,12 +72,17 @@ impl MilEmitter {
             states,
             constants: HashMap::new(),
             produced: HashSet::new(),
+            buffers: HashSet::new(),
             weights,
             next: 0,
         };
-        for (&tensor, (name, shape, storage)) in program.feed_tensors().iter().zip(program.inputs())
+        for ((&tensor, (name, shape, storage)), strides) in program
+            .feed_tensors()
+            .iter()
+            .zip(program.inputs())
+            .zip(program.input_strides())
         {
-            emitter.input(tensor, name, shape, *storage);
+            emitter.input(tensor, name, shape, *storage, *strides);
         }
         for op in program.ops() {
             emitter.op(op)?;
@@ -96,7 +102,24 @@ impl MilEmitter {
         Ok((text, outputs, emitter.weights))
     }
 
-    fn input(&mut self, tensor: Tensor, name: &str, shape: &[usize; 4], storage: DataType) {
+    fn input(
+        &mut self,
+        tensor: Tensor,
+        name: &str,
+        shape: &[usize; 4],
+        storage: DataType,
+        strides: Option<[usize; 4]>,
+    ) {
+        if let Some(strides) = strides {
+            self.arguments
+                .push(format!("{} {name}", buffer_ty(storage, shape, &strides)));
+            let value = self.assign(
+                ty(storage, shape),
+                format!("tensor_buffer_to_tensor<ios17>(input = {name})"),
+            );
+            self.names.insert(tensor, value);
+            return;
+        }
         let declared = if self.states.contains(&tensor) {
             format!("state<{}>", ty(tensor.data_type(), shape))
         } else if storage == DataType::Int32 {
@@ -122,6 +145,15 @@ impl MilEmitter {
     ) -> Result<String, IrError> {
         let shape = tensor.physical_shape();
         let value = self.value(tensor)?;
+        if self.buffers.contains(&value) {
+            return if storage == tensor.data_type() {
+                Ok(value)
+            } else {
+                Err(IrError::InvalidProgram(
+                    "a buffer output keeps its storage type",
+                ))
+            };
+        }
         if storage != tensor.data_type() {
             return Ok(self.convert(&value, tensor.data_type(), storage, &shape));
         }
@@ -170,6 +202,7 @@ impl MilEmitter {
                 self.constant_dequantize(op)?
             }
             O::DynamicSlice => self.dynamic_slice(op)?,
+            O::TensorToTensorBuffer => self.buffer_store(op)?,
             O::Gather => self.gather(op)?,
             _ => self.generic(op)?,
         };
@@ -379,6 +412,24 @@ impl MilEmitter {
         ))
     }
 
+    fn buffer_store(&mut self, op: &BuiltinOp) -> Result<String, IrError> {
+        let output = op.outputs[0];
+        let Some(Value::Int32List(strides)) = attribute(op, P::Strides) else {
+            unreachable!("validated buffer strides")
+        };
+        let source = self.value(input(op, P::X))?;
+        let name = self.assign(
+            buffer_ty(output.data_type(), &output.physical_shape(), strides),
+            format!(
+                "tensor_to_tensor_buffer<ios17>(input = {source}, \
+                 interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), strides = {})",
+                list("int64", strides.iter().map(usize::to_string))
+            ),
+        );
+        self.buffers.insert(name.clone());
+        Ok(name)
+    }
+
     fn dynamic_slice(&mut self, op: &BuiltinOp) -> Result<String, IrError> {
         let x = input(op, P::X);
         let axis = integer_attribute(op, P::Axis);
@@ -564,6 +615,15 @@ fn ty_of(tensor: Tensor) -> String {
 
 fn ty(dtype: DataType, shape: &[usize]) -> String {
     format!("tensor<{}, {}>", dtype.as_str(), dimensions(shape))
+}
+
+fn buffer_ty(dtype: DataType, shape: &[usize], strides: &[usize]) -> String {
+    format!(
+        "tensor_buffer<{}, shape={}, strides={}, interleave_factors=[1, 1, 1, 1]>",
+        dtype.as_str(),
+        dimensions(shape),
+        dimensions(strides)
+    )
 }
 
 fn dimensions(shape: &[usize]) -> String {

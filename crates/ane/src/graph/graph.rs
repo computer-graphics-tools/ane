@@ -77,7 +77,7 @@ impl Graph {
                     None => tensors
                         .iter()
                         .map(|t| match t.data_type() {
-                            DataType::Float16 => DataType::Float32,
+                            DataType::Float16 if !self.is_buffer_output(t) => DataType::Float32,
                             dtype => dtype,
                         })
                         .collect(),
@@ -90,6 +90,13 @@ impl Graph {
             &self.state.borrow().states,
             descriptor.quality_of_service,
         )
+    }
+
+    fn is_buffer_output(&self, tensor: &Tensor) -> bool {
+        self.state.borrow().ops.iter().any(|(op, _)| {
+            matches!(op, Op::Builtin(op)
+                if op.operation == Operator::TensorToTensorBuffer && op.outputs.contains(tensor))
+        })
     }
 
     /// Compiles the targets, runs them once with `feeds` and returns results in target order.
@@ -120,7 +127,8 @@ impl Graph {
         output_types: &[DataType],
     ) -> Result<Program, GraphError> {
         let LoweredGraph { ops, inputs } = self.lower(outputs, output_types, &[])?;
-        Ok(Program::new("main", &ops, &inputs, outputs, output_types)?)
+        let program = Program::new("main", &ops, &inputs, outputs, output_types)?;
+        Ok(program.with_input_strides(&self.state.borrow().input_buffer_strides))
     }
 
     fn lower(
@@ -228,7 +236,23 @@ impl Graph {
     ) -> Result<Program, GraphError> {
         let state = self.state.borrow();
         let LoweredGraph { ops: live, inputs } = self.lower(outputs, output_types, effects)?;
-        let program = Program::new(name, &live, &inputs, outputs, output_types)?;
+        let program = Program::new(name, &live, &inputs, outputs, output_types)?
+            .with_input_strides(&state.input_buffer_strides);
+        for op in &live {
+            let Op::Builtin(store) = op else {
+                continue;
+            };
+            if store.operation == Operator::TensorToTensorBuffer
+                && (!outputs.contains(&store.outputs[0])
+                    || live
+                        .iter()
+                        .any(|user| user.bottoms().contains(&store.outputs[0])))
+            {
+                return Err(GraphError::UnsupportedComposition(
+                    "a buffer output must be a compilation target and cannot feed other operations",
+                ));
+            }
+        }
         if program.inputs().is_empty() || program.outputs().is_empty() {
             return Err(GraphError::UnsupportedComposition(
                 "ANE programs require a live input and an observable output; include the updated state as an output",

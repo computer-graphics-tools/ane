@@ -148,6 +148,7 @@ operators! {
     [Split => "split"] (X: Tensor, SplitSizes: Int32List, Axis: Int32);
     [Stack => "stack"] (Values: Tensor, Axis: Int32);
     [Concat => "concat"] (Values: Tensor, Axis: Int32, Interleave: Bool);
+    [TensorToTensorBuffer => "tensor_to_tensor_buffer"] (X: Tensor, Strides: Int32List);
     [Tile => "tile"] (X: Tensor, Reps: Int32List);
     [Reverse => "reverse"] (X: Tensor, Axes: Int32List);
     [Pad => "pad"] (X: FloatTensor, Pad: Int32List, Mode: String, ConstantVal: Fp16);

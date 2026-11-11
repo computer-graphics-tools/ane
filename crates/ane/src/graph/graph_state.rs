@@ -8,6 +8,7 @@ use crate::{DataType, StateData};
 
 pub struct GraphState {
     pub inputs: Vec<(Tensor, DataType)>,
+    pub input_buffer_strides: HashMap<Tensor, [usize; 4]>,
     pub constants: HashMap<usize, WeightBlob>,
     pub ops: Vec<(Op, Tensor)>,
     pub tensors: Vec<Tensor>,
@@ -20,6 +21,7 @@ impl Default for GraphState {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self {
             inputs: Vec::new(),
+            input_buffer_strides: HashMap::new(),
             constants: HashMap::new(),
             ops: Vec::new(),
             tensors: Vec::new(),
