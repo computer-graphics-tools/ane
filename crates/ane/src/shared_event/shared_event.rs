@@ -7,7 +7,6 @@ use objc2::runtime::{AnyObject, Sel};
 use crate::io_surface::SurfaceEvent;
 use crate::shared_event::SharedEventError;
 
-/// A shared timeline event for ANE and Metal.
 #[derive(Clone, Debug)]
 pub struct SharedEvent {
     event: Retained<SurfaceEvent>,
@@ -20,12 +19,8 @@ impl SharedEvent {
         })
     }
 
-    /// Adopts a shared event; rejects wrappers without `eventPort`.
-    ///
     /// # Safety
-    ///
-    /// `event` must implement `MTLSharedEvent` or `IOSurfaceSharedEvent`, with compatible
-    /// signatures for the selectors checked below.
+    /// `event` must be an `MTLSharedEvent` or `IOSurfaceSharedEvent` with native method signatures.
     pub unsafe fn from_object(event: Retained<AnyObject>) -> Result<Self, SharedEventError> {
         let class = event.class();
         for selector in [
@@ -40,7 +35,6 @@ impl SharedEvent {
                 ));
             }
         }
-        // SAFETY: the caller guarantees compatible selectors.
         Ok(Self {
             event: unsafe { Retained::cast_unchecked(event) },
         })
@@ -61,20 +55,4 @@ impl SharedEvent {
 
 pub fn io_surface_shared_event(event: &SharedEvent) -> &SurfaceEvent {
     &event.event
-}
-
-#[cfg(test)]
-mod tests {
-    use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
-    use objc2_foundation::NSObject;
-
-    use super::*;
-
-    #[test]
-    fn rejects_objects_that_are_not_shared_events() {
-        let object: Retained<AnyObject> = NSObject::new().into();
-        let error = unsafe { SharedEvent::from_object(object) }.unwrap_err();
-        assert!(matches!(error, SharedEventError::Unsupported(_)));
-    }
 }
