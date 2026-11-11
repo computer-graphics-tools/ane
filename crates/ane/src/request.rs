@@ -15,8 +15,7 @@ pub struct Request {
     bindings: Box<[u32]>,
 }
 
-// SAFETY: the Objective-C request is only evaluated or mapped through `LoadedProgram`, which
-// serializes those calls, and its surfaces are guarded by surface leases.
+// SAFETY: LoadedProgram serializes native calls; surface access is leased or event-ordered.
 unsafe impl Send for Request {}
 unsafe impl Sync for Request {}
 
@@ -75,6 +74,7 @@ impl Request {
             completion: OnceLock::new(),
             access: access.into(),
             bindings,
+
         }))
     }
 
@@ -95,9 +95,23 @@ impl Request {
         self: &Arc<Self>,
         descriptor: Option<&ExecutionDescriptor<'_>>,
     ) -> Result<Arc<Outcome>, Error> {
-        let descriptor = descriptor.copied().unwrap_or_default();
         let completion = self.completion()?;
-        let (value, outcome) = completion.begin(self.clone(), self.acquire()?)?;
+        let outcome = Arc::new(Outcome::default());
+        let value = completion.begin(
+            self.clone(),
+            self.acquire()?,
+            outcome.clone(),
+        )?;
+        self.start(&descriptor.copied().unwrap_or_default(), &completion, value)?;
+        Ok(outcome)
+    }
+
+    fn start(
+        &self,
+        descriptor: &ExecutionDescriptor<'_>,
+        completion: &Completion,
+        value: u64,
+    ) -> Result<(), Error> {
         let wait: Vec<_> = descriptor
             .wait_events
             .iter()
@@ -118,7 +132,7 @@ impl Request {
             completion.abort();
             return Err(error);
         }
-        Ok(outcome)
+        Ok(())
     }
 
     fn acquire(&self) -> Result<Vec<SurfaceLease>, Error> {

@@ -35,7 +35,8 @@ impl Completion {
         &self,
         request: Arc<Request>,
         leases: Vec<SurfaceLease>,
-    ) -> Result<(u64, Arc<Outcome>), Error> {
+        outcome: Arc<Outcome>,
+    ) -> Result<u64, Error> {
         let mut state = self.state.lock().map_err(|_| Error::Synchronization)?;
         if state.request.is_some() {
             return Err(Error::BufferBusy);
@@ -45,11 +46,10 @@ impl Completion {
             .checked_add(1)
             .ok_or(Error::Synchronization)?;
         state.leases = leases;
-        let outcome = Arc::new(Outcome::default());
         state.request = Some(request);
-        state.outcome = Some(outcome.clone());
+        state.outcome = Some(outcome);
         state.event_value = value;
-        Ok((value, outcome))
+        Ok(value)
     }
 
     pub fn complete(&self, result: Result<(), Error>) {

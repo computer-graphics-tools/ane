@@ -1,6 +1,8 @@
 use std::time::Duration;
 
+use obfstr::obfcstr;
 use objc2::rc::Retained;
+use objc2::runtime::{AnyObject, Sel};
 
 use crate::io_surface::SurfaceEvent;
 use crate::shared_event::SharedEventError;
@@ -12,8 +14,28 @@ pub struct SharedEvent {
 
 impl SharedEvent {
     pub fn new() -> Result<Self, SharedEventError> {
+        // SAFETY: SurfaceEvent creates a native IOSurface shared event.
+        unsafe { Self::from_object(Retained::cast_unchecked(SurfaceEvent::new()?)) }
+    }
+
+    /// # Safety
+    /// `event` must be an `MTLSharedEvent` or `IOSurfaceSharedEvent` with native method signatures.
+    pub(crate) unsafe fn from_object(event: Retained<AnyObject>) -> Result<Self, SharedEventError> {
+        let class = event.class();
+        for selector in [
+            obfcstr!(c"signaledValue"),
+            obfcstr!(c"setSignaledValue:"),
+            obfcstr!(c"waitUntilSignaledValue:timeoutMS:"),
+            obfcstr!(c"eventPort"),
+        ] {
+            if !class.responds_to(Sel::register(selector)) {
+                return Err(SharedEventError::Unsupported(
+                    selector.to_string_lossy().into_owned(),
+                ));
+            }
+        }
         Ok(Self {
-            event: SurfaceEvent::new()?,
+            event: unsafe { Retained::cast_unchecked(event) },
         })
     }
 
