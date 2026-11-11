@@ -2,6 +2,7 @@ use objc2::{Message, rc::Retained};
 use objc2_io_surface::IOSurface;
 
 use crate::apple_neural_engine::ANERequest;
+use crate::completion_state::{Callback, Sink};
 use crate::io_surface::SurfaceLease;
 use crate::shared_event::io_surface_shared_event;
 use crate::{Completion, Error, ExecutionDescriptor, IOSurfaceError, LoadedProgram, Outcome};
@@ -13,6 +14,9 @@ pub struct Request {
     completion: OnceLock<Arc<Completion>>,
     access: Box<[(Retained<IOSurface>, bool)]>,
     bindings: Box<[u32]>,
+    procedure: u32,
+    inputs: Box<[(Retained<IOSurface>, u32, bool)]>,
+    outputs: Box<[(Retained<IOSurface>, u32)]>,
 }
 
 // SAFETY: the Objective-C request is only evaluated or mapped through `LoadedProgram`, which
@@ -75,6 +79,15 @@ impl Request {
             completion: OnceLock::new(),
             access: access.into(),
             bindings,
+            procedure,
+            inputs: inputs
+                .iter()
+                .map(|&(surface, index, write)| (surface.retain(), index, write))
+                .collect(),
+            outputs: outputs
+                .iter()
+                .map(|&(surface, index)| (surface.retain(), index))
+                .collect(),
         }))
     }
 
@@ -95,9 +108,62 @@ impl Request {
         self: &Arc<Self>,
         descriptor: Option<&ExecutionDescriptor<'_>>,
     ) -> Result<Arc<Outcome>, Error> {
-        let descriptor = descriptor.copied().unwrap_or_default();
         let completion = self.completion()?;
-        let (value, outcome) = completion.begin(self.clone(), self.acquire()?)?;
+        let outcome = Arc::new(Outcome::default());
+        let value = completion.begin(
+            self.clone(),
+            self.acquire()?,
+            Sink::Outcome(outcome.clone()),
+        )?;
+        self.start(&descriptor.copied().unwrap_or_default(), &completion, value)?;
+        Ok(outcome)
+    }
+
+    pub fn duplicate(&self) -> Result<Arc<Self>, Error> {
+        let inputs: Vec<_> = self
+            .inputs
+            .iter()
+            .map(|(surface, index, write)| (&**surface, *index, *write))
+            .collect();
+        let outputs: Vec<_> = self
+            .outputs
+            .iter()
+            .map(|(surface, index)| (&**surface, *index))
+            .collect();
+        Self::new(
+            self.program.clone(),
+            self.procedure,
+            &inputs,
+            &outputs,
+            self.bindings.clone(),
+        )
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.completion
+            .get()
+            .is_none_or(|completion| completion.is_idle())
+    }
+
+    /// # Safety
+    ///
+    /// The request must be idle. See [`crate::BoundRequest::submit_unchecked`] for surface ordering.
+    pub unsafe fn submit_callback(
+        self: &Arc<Self>,
+        descriptor: &ExecutionDescriptor<'_>,
+        callback: Callback,
+    ) -> Result<(), Error> {
+        let completion = self.completion()?;
+        let value = completion.begin(self.clone(), Vec::new(), Sink::Callback(callback))?;
+        self.start(descriptor, &completion, value)
+    }
+
+    fn start(
+        &self,
+        descriptor: &ExecutionDescriptor<'_>,
+        completion: &Completion,
+        value: u64,
+    ) -> Result<(), Error> {
         let wait: Vec<_> = descriptor
             .wait_events
             .iter()
@@ -118,7 +184,7 @@ impl Request {
             completion.abort();
             return Err(error);
         }
-        Ok(outcome)
+        Ok(())
     }
 
     fn acquire(&self) -> Result<Vec<SurfaceLease>, Error> {

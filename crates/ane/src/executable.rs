@@ -7,8 +7,8 @@ use objc2_foundation::NSQualityOfService;
 
 use crate::ir::MilProgram;
 use crate::{
-    CompilationReport, Error, ExecutionDescriptor, LoadedProgram, Procedure, Program, Request,
-    RequestCache, StateData, Submission, Tensor, TensorData, TensorSpec,
+    BoundRequest, CompilationReport, Error, ExecutionDescriptor, LoadedProgram, Procedure, Program,
+    Request, RequestCache, StateData, Submission, Tensor, TensorData, TensorSpec,
 };
 
 /// A compiled ANE program for one set of targets, run with `run` or `run_async`. Executables from
@@ -143,6 +143,15 @@ impl Executable {
     ) -> Result<Submission, Error> {
         let (request, results) = self.request(inputs, results)?;
         Ok(Submission::new(request.submit(descriptor)?, results))
+    }
+
+    /// Binds inputs in feed order and results in target order for reuse.
+    pub fn bind(
+        &self,
+        inputs: &[&TensorData],
+        results: &[&TensorData],
+    ) -> Result<BoundRequest, Error> {
+        Ok(BoundRequest::new(self.procedure.request(inputs, results)?))
     }
 
     fn request(

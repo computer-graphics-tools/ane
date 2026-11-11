@@ -8,6 +8,7 @@ mod raw_message;
 compile_error!("ANE tensor storage requires a little-endian target");
 
 mod apple_neural_engine;
+mod bound_request;
 mod compilation_descriptor;
 mod compilation_report;
 mod completion;
@@ -30,9 +31,11 @@ mod shared_event;
 mod state_data;
 mod submission;
 mod tensor_data;
+mod timeline;
 mod unavailable_interface;
 
 pub use apple_neural_engine::AneError;
+pub use bound_request::BoundRequest;
 pub use compilation_descriptor::CompilationDescriptor;
 pub use compilation_report::CompilationReport;
 pub use core::{DataType, GeluMode, PadFillMode, PadMode, WeightDataType};
@@ -55,6 +58,7 @@ pub use submission::Submission;
 pub use tensor_data::{
     LockedSlice, LockedSliceMut, TensorData, TensorDataError, TensorElement, TensorSpec,
 };
+pub use timeline::{Timeline, Trip};
 pub use unavailable_interface::UnavailableInterface;
 
 use completion::Completion;
