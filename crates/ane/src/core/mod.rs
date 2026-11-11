@@ -9,5 +9,7 @@ pub use data_type::DataType;
 pub use gelu_mode::GeluMode;
 pub use pad_fill_mode::PadFillMode;
 pub use pad_mode::PadMode;
-pub use shape::{logical_shape, padded_shape};
+pub use shape::{logical_shape, padded_shape, row_strides};
 pub use weight_data_type::WeightDataType;
+
+pub(crate) const BUFFER_ROW_ALIGNMENT: usize = 64;

@@ -59,7 +59,7 @@ pub use unavailable_interface::UnavailableInterface;
 
 use completion::Completion;
 use completion_state::CompletionState;
-use core::{logical_shape, padded_shape};
+use core::{logical_shape, padded_shape, row_strides};
 use error::require;
 use loaded_program::LoadedProgram;
 use outcome::Outcome;

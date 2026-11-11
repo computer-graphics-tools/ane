@@ -1,3 +1,5 @@
+use super::BUFFER_ROW_ALIGNMENT;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DataType {
     Float32,
@@ -28,6 +30,11 @@ impl DataType {
             Self::Float16 | Self::Int16 | Self::UInt16 => 2,
             Self::Int8 | Self::UInt8 | Self::Bool => 1,
         }
+    }
+
+    /// Row stride in elements, padded to 64-byte alignment.
+    pub const fn aligned_row_stride(self, width: usize) -> usize {
+        (width * self.byte_width()).next_multiple_of(BUFFER_ROW_ALIGNMENT) / self.byte_width()
     }
 
     pub const fn as_str(self) -> &'static str {

@@ -1,5 +1,7 @@
 use crate::graph::TensorHandle;
 use crate::ir::{IrError, MilProgram, Op, validate_program};
+use std::collections::HashMap;
+
 use crate::{DataType, Tensor};
 
 #[derive(Clone, PartialEq)]
@@ -9,6 +11,7 @@ pub struct Program {
     feed_tensors: Box<[Tensor]>,
     target_tensors: Box<[Tensor]>,
     inputs: Box<[(String, [usize; 4], DataType)]>,
+    input_strides: Box<[Option<[usize; 4]>]>,
     outputs: Box<[(String, [usize; 4], DataType)]>,
 }
 
@@ -30,6 +33,17 @@ impl Program {
     }
     pub fn outputs(&self) -> &[(String, [usize; 4], DataType)] {
         &self.outputs
+    }
+    pub fn with_input_strides(mut self, strides: &HashMap<Tensor, [usize; 4]>) -> Self {
+        self.input_strides = self
+            .feed_tensors
+            .iter()
+            .map(|tensor| strides.get(tensor).copied())
+            .collect();
+        self
+    }
+    pub fn input_strides(&self) -> &[Option<[usize; 4]>] {
+        &self.input_strides
     }
     pub fn new(
         name: &str,
@@ -58,6 +72,7 @@ impl Program {
                 .iter()
                 .map(|(t, d)| (t.symbol(), t.physical_shape(), *d))
                 .collect(),
+            input_strides: inputs.iter().map(|_| None).collect(),
             outputs: outputs
                 .iter()
                 .enumerate()

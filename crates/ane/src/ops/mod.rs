@@ -3,6 +3,7 @@
 mod activation_ops;
 mod arithmetic_ops;
 mod blockwise_quantization;
+mod buffer_ops;
 mod convolution2d_descriptor;
 mod convolution_ops;
 mod convolution_transpose2d_descriptor;
