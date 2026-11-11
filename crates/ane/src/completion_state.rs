@@ -1,19 +1,12 @@
 use std::sync::Arc;
 
 use crate::io_surface::SurfaceLease;
-use crate::{Error, Outcome, Request};
-
-pub type Callback = Box<dyn FnOnce(Result<(), Error>) + Send>;
-
-pub enum Sink {
-    Outcome(Arc<Outcome>),
-    Callback(Callback),
-}
+use crate::{Outcome, Request};
 
 #[derive(Default)]
 pub struct CompletionState {
     pub request: Option<Arc<Request>>,
-    pub sink: Option<Sink>,
+    pub outcome: Option<Arc<Outcome>>,
     pub leases: Vec<SurfaceLease>,
     pub event_value: u64,
 }

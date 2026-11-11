@@ -14,14 +14,13 @@ pub struct SharedEvent {
 
 impl SharedEvent {
     pub fn new() -> Result<Self, SharedEventError> {
-        Ok(Self {
-            event: SurfaceEvent::new()?,
-        })
+        // SAFETY: SurfaceEvent creates a native IOSurface shared event.
+        unsafe { Self::from_object(Retained::cast_unchecked(SurfaceEvent::new()?)) }
     }
 
     /// # Safety
     /// `event` must be an `MTLSharedEvent` or `IOSurfaceSharedEvent` with native method signatures.
-    pub unsafe fn from_object(event: Retained<AnyObject>) -> Result<Self, SharedEventError> {
+    pub(crate) unsafe fn from_object(event: Retained<AnyObject>) -> Result<Self, SharedEventError> {
         let class = event.class();
         for selector in [
             obfcstr!(c"signaledValue"),
