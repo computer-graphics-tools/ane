@@ -74,7 +74,6 @@ impl Completion {
                 .send(request)
                 .unwrap_or_else(|_| panic!("ANE cleanup worker stopped"));
         }
-        // After the state is released, so a handler can submit the request again.
         match action {
             Some(CompletionAction::StoreResult(submission_result)) => {
                 submission_result.finish(result)
