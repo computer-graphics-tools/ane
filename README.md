@@ -35,6 +35,8 @@ cargo run --release --example mutable_matmul
 
 The example binds an FP16 weight IOSurface as a variable, rewrites it from the CPU between executions without recompiling, and checks every output exactly.
 
+![Mutable weights running on ANE](mutable-matmul.png)
+
 ## Research
 
 The ANE internals research behind this crate was inspired by Mohamed Ghannam's [weightBufs exploit chain](https://cra.sh/public_html/strlcpy3/iosmacos-exploit-chain-cve-2022-32845-32948-42805-32899-weightbufs) writeup, which documents the ANE architecture, the `aned` / `ANECompilerService` pipeline, and the kernel interface (`AppleH11ANEInterface`).
