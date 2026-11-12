@@ -16,6 +16,7 @@ mod completion_state;
 mod core;
 mod device;
 mod error;
+mod event_sequence;
 mod executable;
 mod execution_descriptor;
 mod graph;
@@ -31,7 +32,6 @@ mod state_data;
 mod submission;
 mod submission_result;
 mod tensor_data;
-mod timeline;
 mod unavailable_interface;
 
 pub use apple_neural_engine::AneError;
@@ -58,13 +58,13 @@ pub use submission::Submission;
 pub use tensor_data::{
     LockedSlice, LockedSliceMut, TensorData, TensorDataError, TensorElement, TensorSpec,
 };
-use timeline::{Timeline, Trip};
 pub use unavailable_interface::UnavailableInterface;
 
 use completion::Completion;
 use completion_state::CompletionState;
 use core::{logical_shape, padded_shape, row_strides};
 use error::require;
+use event_sequence::{EventSequence, EventValues};
 use loaded_program::LoadedProgram;
 use procedure::Procedure;
 use request::Request;
