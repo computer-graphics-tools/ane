@@ -12,4 +12,4 @@ pub use pad_mode::PadMode;
 pub use shape::{logical_shape, padded_shape, row_strides};
 pub use weight_data_type::WeightDataType;
 
-pub(crate) const BUFFER_ROW_ALIGNMENT: usize = 64;
+pub const BUFFER_ROW_ALIGNMENT: usize = 64;

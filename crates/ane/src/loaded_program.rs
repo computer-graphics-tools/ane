@@ -19,8 +19,7 @@ pub struct LoadedProgram {
     qos: NSQualityOfService,
     dispatch: Mutex<()>,
 }
-// SAFETY: model calls are serialized by `dispatch` and `MODEL_LIFECYCLE`; the Objective-C objects
-// are never mutated outside those locks.
+// SAFETY: lifecycle and dispatch locks serialize native model calls.
 unsafe impl Send for LoadedProgram {}
 unsafe impl Sync for LoadedProgram {}
 
@@ -45,21 +44,20 @@ impl LoadedProgram {
         let weights = NSData::from_vec(mil.weights);
         let program = ANEInMemoryModel::new(&*ANEInMemoryModelDescriptor::new(&text, &weights)?)?;
         let directory = std::env::temp_dir().join(program.identifier()?);
-        let loaded = if program.is_compiled() && program.load(qos).is_ok() {
-            Ok(())
-        } else {
+        let loaded: Result<(), Error> = (|| {
             if program.is_compiled() {
+                if program.load(qos).is_ok() {
+                    return Ok(());
+                }
                 program.purge_compiled_model();
             }
             stage(
                 &directory,
                 &[("model.mil", &text), ("weights/weight.bin", &weights)],
-            )
-            .and_then(|()| {
-                program.compile(qos)?;
-                Ok(program.load(qos)?)
-            })
-        };
+            )?;
+            program.compile(qos)?;
+            Ok(program.load(qos)?)
+        })();
         let _ = std::fs::remove_dir_all(&directory);
         loaded?;
         let model = program.model()?;

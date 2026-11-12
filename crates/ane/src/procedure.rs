@@ -9,7 +9,6 @@ use crate::{
     require,
 };
 
-#[derive(Clone)]
 pub struct Procedure {
     index: u32,
     program: Arc<LoadedProgram>,

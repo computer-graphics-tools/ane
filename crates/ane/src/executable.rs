@@ -16,7 +16,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Executable {
     program: Arc<LoadedProgram>,
-    procedure: Procedure,
+    procedure: Arc<Procedure>,
     variables: HashMap<Tensor, TensorData>,
     operations: Arc<[String]>,
     mil_bytes: usize,
@@ -68,7 +68,7 @@ impl Executable {
             .into_iter()
             .map(|procedure| Self {
                 program: program.clone(),
-                procedure,
+                procedure: Arc::new(procedure),
                 variables: variables.clone(),
                 operations: operations.clone(),
                 mil_bytes,
@@ -151,10 +151,7 @@ impl Executable {
         inputs: &[&TensorData],
         results: &[&TensorData],
     ) -> Result<BoundExecution, Error> {
-        Ok(BoundExecution::new(
-            self.procedure.request(inputs, results)?,
-            results.iter().map(|data| (*data).clone()).collect(),
-        ))
+        BoundExecution::new(self.procedure.clone(), inputs, results)
     }
 
     fn request(

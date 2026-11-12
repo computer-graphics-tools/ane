@@ -4,18 +4,18 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crate::{Error, Outcome, TensorData};
+use crate::{Error, SubmissionResult, TensorData};
 
 pub struct Submission {
-    outcome: Arc<Outcome>,
+    submission_result: Arc<SubmissionResult>,
     results: Box<[TensorData]>,
     consumed: bool,
 }
 
 impl Submission {
-    pub fn new(outcome: Arc<Outcome>, results: Box<[TensorData]>) -> Self {
+    pub fn new(submission_result: Arc<SubmissionResult>, results: Box<[TensorData]>) -> Self {
         Self {
-            outcome,
+            submission_result,
             results,
             consumed: false,
         }
@@ -26,19 +26,19 @@ impl Submission {
     }
 
     pub fn is_finished(&self) -> bool {
-        self.consumed || self.outcome.is_finished()
+        self.consumed || self.submission_result.is_finished()
     }
 
     pub fn wait(mut self) -> Result<Box<[TensorData]>, Error> {
         if !self.consumed {
             self.consumed = true;
-            self.outcome.wait()?;
+            self.submission_result.wait()?;
         }
         Ok(std::mem::take(&mut self.results))
     }
 
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        self.consumed || self.outcome.wait_timeout(timeout)
+        self.consumed || self.submission_result.wait_timeout(timeout)
     }
 }
 
@@ -47,7 +47,7 @@ impl Future for Submission {
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if !this.consumed {
-            match this.outcome.poll(context.waker()) {
+            match this.submission_result.poll(context.waker()) {
                 None => return Poll::Pending,
                 Some(result) => {
                     this.consumed = true;

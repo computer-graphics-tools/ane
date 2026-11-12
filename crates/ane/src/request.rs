@@ -2,9 +2,13 @@ use objc2::{Message, rc::Retained};
 use objc2_io_surface::IOSurface;
 
 use crate::apple_neural_engine::ANERequest;
+use crate::completion_state::CompletionAction;
+use crate::completion_state::CompletionHandler;
 use crate::io_surface::SurfaceLease;
 use crate::shared_event::io_surface_shared_event;
-use crate::{Completion, Error, ExecutionDescriptor, IOSurfaceError, LoadedProgram, Outcome};
+use crate::{
+    Completion, Error, ExecutionDescriptor, IOSurfaceError, LoadedProgram, SubmissionResult,
+};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct Request {
@@ -74,7 +78,6 @@ impl Request {
             completion: OnceLock::new(),
             access: access.into(),
             bindings,
-
         }))
     }
 
@@ -94,16 +97,33 @@ impl Request {
     pub fn submit(
         self: &Arc<Self>,
         descriptor: Option<&ExecutionDescriptor<'_>>,
-    ) -> Result<Arc<Outcome>, Error> {
+    ) -> Result<Arc<SubmissionResult>, Error> {
         let completion = self.completion()?;
-        let outcome = Arc::new(Outcome::default());
+        let submission_result = Arc::new(SubmissionResult::default());
         let value = completion.begin(
             self.clone(),
             self.acquire()?,
-            outcome.clone(),
+            CompletionAction::StoreResult(submission_result.clone()),
         )?;
         self.start(&descriptor.copied().unwrap_or_default(), &completion, value)?;
-        Ok(outcome)
+        Ok(submission_result)
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.completion
+            .get()
+            .is_none_or(|completion| completion.is_idle())
+    }
+
+    pub fn submit_callback(
+        self: &Arc<Self>,
+        descriptor: &ExecutionDescriptor<'_>,
+        handler: CompletionHandler,
+    ) -> Result<(), Error> {
+        let completion = self.completion()?;
+        let value =
+            completion.begin(self.clone(), Vec::new(), CompletionAction::Notify(handler))?;
+        self.start(descriptor, &completion, value)
     }
 
     fn start(
