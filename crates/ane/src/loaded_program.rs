@@ -45,16 +45,21 @@ impl LoadedProgram {
         let weights = NSData::from_vec(mil.weights);
         let program = ANEInMemoryModel::new(&*ANEInMemoryModelDescriptor::new(&text, &weights)?)?;
         let directory = std::env::temp_dir().join(program.identifier()?);
-        let loaded = stage(
-            &directory,
-            &[("model.mil", &text), ("weights/weight.bin", &weights)],
-        )
-        .and_then(|()| {
-            if !program.is_compiled() {
-                program.compile(qos)?;
+        let loaded = if program.is_compiled() && program.load(qos).is_ok() {
+            Ok(())
+        } else {
+            if program.is_compiled() {
+                program.purge_compiled_model();
             }
-            Ok(program.load(qos)?)
-        });
+            stage(
+                &directory,
+                &[("model.mil", &text), ("weights/weight.bin", &weights)],
+            )
+            .and_then(|()| {
+                program.compile(qos)?;
+                Ok(program.load(qos)?)
+            })
+        };
         let _ = std::fs::remove_dir_all(&directory);
         loaded?;
         let model = program.model()?;
