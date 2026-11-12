@@ -26,7 +26,6 @@ mod ops;
 mod procedure;
 mod request;
 mod request_cache;
-mod request_slots;
 mod shared_event;
 mod state_data;
 mod submission;
@@ -54,7 +53,6 @@ pub use ops::{
     CoordinateMode, Palette, Palettization, Pooling2dDescriptor, ResizeSamplingMode,
     SamplingDescriptor, SamplingMode,
 };
-use request_slots::RequestSlots;
 pub use shared_event::{SharedEvent, SharedEventError};
 pub use submission::Submission;
 pub use tensor_data::{

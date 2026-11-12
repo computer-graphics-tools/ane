@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::{Error, ExecutionDescriptor, RequestSlots, SharedEvent};
+use crate::{BoundExecution, Error, ExecutionDescriptor, SharedEvent};
 
 pub(crate) struct Timeline {
     event: SharedEvent,
@@ -42,11 +42,11 @@ impl Timeline {
     /// `on_failure` must not panic or wait for ANE work.
     /// # Safety
     /// Use a trip reserved here. Trips on one timeline must not overlap; keep event values ordered.
-    /// Write inputs before `ready`; access results after `done`. See [`RequestSlots::submit`].
+    /// Write inputs before `ready`; access results after `done`. See [`BoundExecution::submit_ordered`].
     pub unsafe fn submit(
         &self,
         trip: Trip,
-        execution: &RequestSlots,
+        execution: &BoundExecution,
         on_failure: impl FnOnce(&Error) + Send + 'static,
     ) -> Result<(), Error> {
         let descriptor = ExecutionDescriptor {
@@ -56,7 +56,7 @@ impl Timeline {
         let event = self.event.clone();
         // SAFETY: forwarded to the caller; the failure path signals `done` itself.
         unsafe {
-            execution.submit(&descriptor, move |result| {
+            execution.submit_ordered(&descriptor, move |result| {
                 if let Err(error) = result {
                     on_failure(&error);
                     event.set_signaled_value(trip.done);

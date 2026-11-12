@@ -157,16 +157,6 @@ impl Executable {
         ))
     }
 
-    pub(crate) fn bind_ordered(
-        &self,
-        inputs: &[&TensorData],
-        results: &[&TensorData],
-    ) -> Result<crate::RequestSlots, Error> {
-        Ok(crate::RequestSlots::new(
-            self.procedure.request(inputs, results)?,
-        ))
-    }
-
     fn request(
         &self,
         inputs: &[&TensorData],

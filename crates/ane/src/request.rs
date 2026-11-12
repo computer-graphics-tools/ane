@@ -148,7 +148,7 @@ impl Request {
     }
 
     /// # Safety
-    /// The request must be idle. See [`crate::RequestSlots::submit`] for surface ordering.
+    /// The request must be idle. See [`BoundExecution::submit_ordered`](crate::BoundExecution::submit_ordered) for surface ordering.
     pub unsafe fn submit_callback(
         self: &Arc<Self>,
         descriptor: &ExecutionDescriptor<'_>,
