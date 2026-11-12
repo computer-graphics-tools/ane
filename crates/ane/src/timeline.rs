@@ -56,8 +56,8 @@ impl Timeline {
         let event = self.event.clone();
         // SAFETY: forwarded to the caller; the failure path signals `done` itself.
         unsafe {
-            execution.submit(&descriptor, move |outcome| {
-                if let Err(error) = outcome {
+            execution.submit(&descriptor, move |result| {
+                if let Err(error) = result {
                     on_failure(&error);
                     event.set_signaled_value(trip.done);
                 }

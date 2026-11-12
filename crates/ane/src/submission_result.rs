@@ -5,13 +5,13 @@ use std::time::Duration;
 use crate::Error;
 
 #[derive(Default)]
-pub struct Outcome {
+pub struct SubmissionResult {
     result: Mutex<Option<Result<(), Error>>>,
     waker: Mutex<Option<Waker>>,
     done: Condvar,
 }
 
-impl Outcome {
+impl SubmissionResult {
     pub fn finish(&self, result: Result<(), Error>) {
         let mut slot = self.result();
         *slot = Some(result);
