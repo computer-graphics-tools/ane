@@ -1,18 +1,27 @@
 use std::sync::{Arc, Mutex};
 
-use crate::{Error, ExecutionDescriptor, Request, Submission, TensorData};
+use crate::{Error, ExecutionDescriptor, Function, Request, Submission, TensorData};
 
 pub struct BoundExecution {
+    function: Arc<Function>,
+    inputs: Box<[TensorData]>,
     requests: Mutex<Vec<Arc<Request>>>,
     results: Box<[TensorData]>,
 }
 
 impl BoundExecution {
-    pub(crate) fn new(request: Arc<Request>, results: Box<[TensorData]>) -> Self {
-        Self {
+    pub(crate) fn new(
+        function: Arc<Function>,
+        inputs: &[&TensorData],
+        results: &[&TensorData],
+    ) -> Result<Self, Error> {
+        let request = function.create_request(inputs, results)?;
+        Ok(Self {
+            function,
+            inputs: inputs.iter().map(|data| (*data).clone()).collect(),
             requests: Mutex::new(vec![request]),
-            results,
-        }
+            results: results.iter().map(|data| (*data).clone()).collect(),
+        })
     }
 
     pub fn submit(&self) -> Result<Submission, Error> {
@@ -31,7 +40,9 @@ impl BoundExecution {
         let index = match requests.iter().position(|request| request.is_idle()) {
             Some(index) => index,
             None => {
-                let request = requests[0].duplicate()?;
+                let inputs: Vec<_> = self.inputs.iter().collect();
+                let results: Vec<_> = self.results.iter().collect();
+                let request = self.function.create_request(&inputs, &results)?;
                 requests.push(request);
                 requests.len() - 1
             }

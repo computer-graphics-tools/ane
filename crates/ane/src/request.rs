@@ -17,9 +17,6 @@ pub struct Request {
     completion: OnceLock<Arc<Completion>>,
     access: Box<[(Retained<IOSurface>, bool)]>,
     bindings: Box<[u32]>,
-    procedure: u32,
-    inputs: Box<[(Retained<IOSurface>, u32, bool)]>,
-    outputs: Box<[(Retained<IOSurface>, u32)]>,
 }
 
 // SAFETY: LoadedProgram serializes native calls; surface access is leased or event-ordered.
@@ -29,7 +26,7 @@ unsafe impl Sync for Request {}
 impl Request {
     pub fn new(
         program: Arc<LoadedProgram>,
-        procedure: u32,
+        function_index: u32,
         inputs: &[(&IOSurface, u32, bool)],
         outputs: &[(&IOSurface, u32)],
         bindings: Box<[u32]>,
@@ -72,7 +69,7 @@ impl Request {
             &input_indices,
             &output_surfaces,
             &output_indices,
-            procedure,
+            function_index,
         )?;
         program.map(&inner)?;
         Ok(Arc::new(Self {
@@ -81,15 +78,6 @@ impl Request {
             completion: OnceLock::new(),
             access: access.into(),
             bindings,
-            procedure,
-            inputs: inputs
-                .iter()
-                .map(|&(surface, index, write)| (surface.retain(), index, write))
-                .collect(),
-            outputs: outputs
-                .iter()
-                .map(|&(surface, index)| (surface.retain(), index))
-                .collect(),
         }))
     }
 
@@ -119,26 +107,6 @@ impl Request {
         )?;
         self.start(&descriptor.copied().unwrap_or_default(), &completion, value)?;
         Ok(submission_result)
-    }
-
-    pub fn duplicate(&self) -> Result<Arc<Self>, Error> {
-        let inputs: Vec<_> = self
-            .inputs
-            .iter()
-            .map(|(surface, index, write)| (&**surface, *index, *write))
-            .collect();
-        let outputs: Vec<_> = self
-            .outputs
-            .iter()
-            .map(|(surface, index)| (&**surface, *index))
-            .collect();
-        Self::new(
-            self.program.clone(),
-            self.procedure,
-            &inputs,
-            &outputs,
-            self.bindings.clone(),
-        )
     }
 
     pub fn is_idle(&self) -> bool {

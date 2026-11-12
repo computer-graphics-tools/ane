@@ -21,7 +21,7 @@ impl ANERequest {
         input_indices: &[u32],
         outputs: &[&IOSurface],
         output_indices: &[u32],
-        procedure: u32,
+        function_index: u32,
     ) -> Result<Retained<Self>, AneError> {
         ensure_model_interfaces()?;
         let surfaces = |surfaces: &[&IOSurface]| {
@@ -44,14 +44,14 @@ impl ANERequest {
         let outputs = surfaces(outputs)?;
         let input_indices = indices(input_indices);
         let output_indices = indices(output_indices);
-        let procedure = NSNumber::new_u32(procedure);
+        let function_index = NSNumber::new_u32(function_index);
         unsafe {
             Retained::retain_autoreleased(raw_message!(Self::class(),
                 c"requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:sharedEvents:",
                 &*inputs => &NSArray<ANEIOSurfaceObject>, &*input_indices => &NSArray<NSNumber>,
                 &*outputs => &NSArray<ANEIOSurfaceObject>, &*output_indices => &NSArray<NSNumber>,
                 None => Option<&AnyObject>, None => Option<&AnyObject>,
-                &*procedure => &NSNumber, None => Option<&ANESharedEvents>; *mut Self))
+                &*function_index => &NSNumber, None => Option<&ANESharedEvents>; *mut Self))
         }
         .ok_or(AneError::ObjectCreation(Self::class().name().to_str().expect("invalid runtime class name")))
     }
