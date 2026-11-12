@@ -3,13 +3,13 @@ use std::time::Duration;
 
 use crate::{BoundExecution, Error, ExecutionDescriptor, SharedEvent};
 
-pub(crate) struct EventSequence {
+pub struct EventSequence {
     event: SharedEvent,
     next_value: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct EventValues {
+pub struct EventValues {
     pub inputs_ready: u64,
     pub completed: u64,
 }

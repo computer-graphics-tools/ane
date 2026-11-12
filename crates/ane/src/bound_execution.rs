@@ -10,7 +10,7 @@ pub struct BoundExecution {
 }
 
 impl BoundExecution {
-    pub(crate) fn new(
+    pub fn new(
         procedure: Arc<Procedure>,
         inputs: &[&TensorData],
         results: &[&TensorData],
@@ -31,7 +31,7 @@ impl BoundExecution {
 
     /// # Safety
     /// Synchronize access to the bound surfaces with the descriptor's events.
-    pub(crate) unsafe fn submit_ordered(
+    pub unsafe fn submit_ordered(
         &self,
         descriptor: &ExecutionDescriptor<'_>,
         on_complete: impl FnOnce(Result<(), Error>) + Send + 'static,
