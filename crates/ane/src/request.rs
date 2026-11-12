@@ -26,7 +26,7 @@ unsafe impl Sync for Request {}
 impl Request {
     pub fn new(
         program: Arc<LoadedProgram>,
-        function_index: u32,
+        procedure: u32,
         inputs: &[(&IOSurface, u32, bool)],
         outputs: &[(&IOSurface, u32)],
         bindings: Box<[u32]>,
@@ -69,7 +69,7 @@ impl Request {
             &input_indices,
             &output_surfaces,
             &output_indices,
-            function_index,
+            procedure,
         )?;
         program.map(&inner)?;
         Ok(Arc::new(Self {

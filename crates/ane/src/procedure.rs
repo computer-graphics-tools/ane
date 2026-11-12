@@ -9,7 +9,7 @@ use crate::{
     require,
 };
 
-pub struct Function {
+pub struct Procedure {
     index: u32,
     program: Arc<LoadedProgram>,
     inputs: Box<[TensorSpec]>,
@@ -23,7 +23,7 @@ pub struct Function {
     states: Box<[(Tensor, TensorData)]>,
 }
 
-impl Function {
+impl Procedure {
     pub fn new(
         function: &Program,
         outputs: &[String],
@@ -141,7 +141,7 @@ impl Function {
             .collect::<Result<_, _>>()?)
     }
 
-    pub fn create_request(
+    pub fn request(
         &self,
         inputs: &[&TensorData],
         outputs: &[&TensorData],

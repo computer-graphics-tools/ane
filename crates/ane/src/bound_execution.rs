@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use crate::{Error, ExecutionDescriptor, Function, Request, Submission, TensorData};
+use crate::{Error, ExecutionDescriptor, Procedure, Request, Submission, TensorData};
 
 pub struct BoundExecution {
-    function: Arc<Function>,
+    procedure: Arc<Procedure>,
     inputs: Box<[TensorData]>,
     requests: Mutex<Vec<Arc<Request>>>,
     results: Box<[TensorData]>,
@@ -11,13 +11,13 @@ pub struct BoundExecution {
 
 impl BoundExecution {
     pub(crate) fn new(
-        function: Arc<Function>,
+        procedure: Arc<Procedure>,
         inputs: &[&TensorData],
         results: &[&TensorData],
     ) -> Result<Self, Error> {
-        let request = function.create_request(inputs, results)?;
+        let request = procedure.request(inputs, results)?;
         Ok(Self {
-            function,
+            procedure,
             inputs: inputs.iter().map(|data| (*data).clone()).collect(),
             requests: Mutex::new(vec![request]),
             results: results.iter().map(|data| (*data).clone()).collect(),
@@ -42,7 +42,7 @@ impl BoundExecution {
             None => {
                 let inputs: Vec<_> = self.inputs.iter().collect();
                 let results: Vec<_> = self.results.iter().collect();
-                let request = self.function.create_request(&inputs, &results)?;
+                let request = self.procedure.request(&inputs, &results)?;
                 requests.push(request);
                 requests.len() - 1
             }

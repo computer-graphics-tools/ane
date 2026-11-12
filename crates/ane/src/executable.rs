@@ -7,7 +7,7 @@ use objc2_foundation::NSQualityOfService;
 
 use crate::ir::MilProgram;
 use crate::{
-    BoundExecution, CompilationReport, Error, ExecutionDescriptor, Function, LoadedProgram,
+    BoundExecution, CompilationReport, Error, ExecutionDescriptor, LoadedProgram, Procedure,
     Program, Request, RequestCache, StateData, Submission, Tensor, TensorData, TensorSpec,
 };
 
@@ -16,7 +16,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Executable {
     program: Arc<LoadedProgram>,
-    function: Arc<Function>,
+    procedure: Arc<Procedure>,
     variables: HashMap<Tensor, TensorData>,
     operations: Arc<[String]>,
     mil_bytes: usize,
@@ -49,11 +49,11 @@ impl Executable {
         })?);
         let attributes = program.model_attributes()?;
         let mut variables = HashMap::new();
-        let compiled = functions
+        let procedures = functions
             .iter()
             .zip(&outputs)
             .map(|(function, outputs)| {
-                Function::new(
+                Procedure::new(
                     function,
                     outputs,
                     &attributes,
@@ -64,11 +64,11 @@ impl Executable {
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let constant_bytes = functions.iter().map(Program::constant_bytes).sum();
-        Ok(compiled
+        Ok(procedures
             .into_iter()
-            .map(|function| Self {
+            .map(|procedure| Self {
                 program: program.clone(),
-                function: Arc::new(function),
+                procedure: Arc::new(procedure),
                 variables: variables.clone(),
                 operations: operations.clone(),
                 mil_bytes,
@@ -92,23 +92,23 @@ impl Executable {
     }
     /// Inputs that `run` takes, in order; graph-owned variables are bound automatically.
     pub fn feed_tensors(&self) -> &[Tensor] {
-        self.function.input_tensors()
+        self.procedure.input_tensors()
     }
     /// Target tensors in result order.
     pub fn target_tensors(&self) -> &[Tensor] {
-        self.function.output_tensors()
+        self.procedure.output_tensors()
     }
     /// Layout of an input; `allocate` makes a matching IOSurface.
     pub fn input(&self, tensor: Tensor) -> Result<&TensorSpec, Error> {
-        self.function.input(tensor)
+        self.procedure.input(tensor)
     }
     /// Layout of a result; `allocate` makes a matching IOSurface.
     pub fn output(&self, tensor: Tensor) -> Result<&TensorSpec, Error> {
-        self.function.output(tensor)
+        self.procedure.output(tensor)
     }
     /// New result buffers in target order.
     pub fn allocate_outputs(&self) -> Result<Vec<TensorData>, Error> {
-        self.function.allocate_outputs()
+        self.procedure.allocate_outputs()
     }
     /// IOSurface storage of a variable the graph initialised.
     pub fn variable_data(&self, variable: &Tensor) -> Result<&TensorData, Error> {
@@ -151,7 +151,7 @@ impl Executable {
         inputs: &[&TensorData],
         results: &[&TensorData],
     ) -> Result<BoundExecution, Error> {
-        BoundExecution::new(self.function.clone(), inputs, results)
+        BoundExecution::new(self.procedure.clone(), inputs, results)
     }
 
     fn request(
@@ -160,12 +160,9 @@ impl Executable {
         results: Option<&[&TensorData]>,
     ) -> Result<(Arc<Request>, Box<[TensorData]>), Error> {
         let Some(results) = results else {
-            let results = self.function.allocate_outputs()?;
+            let results = self.procedure.allocate_outputs()?;
             let bound: Vec<_> = results.iter().collect();
-            return Ok((
-                self.function.create_request(inputs, &bound)?,
-                results.into(),
-            ));
+            return Ok((self.procedure.request(inputs, &bound)?, results.into()));
         };
         let bindings: Vec<_> = inputs
             .iter()
@@ -174,7 +171,7 @@ impl Executable {
             .collect();
         let request = self
             .requests
-            .get_or_insert(&bindings, || self.function.create_request(inputs, results))?;
+            .get_or_insert(&bindings, || self.procedure.request(inputs, results))?;
         Ok((
             request,
             results.iter().map(|data| (*data).clone()).collect(),
