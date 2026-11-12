@@ -20,11 +20,8 @@ impl BoundExecution {
         Ok(Submission::new(requests[0].submit(None)?, self.results.clone()))
     }
 
-    /// Queueing errors fire neither handler nor signals.
-    /// `on_complete` must not panic or wait for ANE work.
     /// # Safety
-    /// Order conflicting surface accesses with events; no leases are taken.
-    /// Write inputs before wait events fire; read results after signals or the handler.
+    /// Synchronize access to the bound surfaces with the descriptor's events.
     pub(crate) unsafe fn submit_ordered(
         &self,
         descriptor: &ExecutionDescriptor<'_>,
