@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread::Builder;
 
+use crate::completion_state::Sink;
 use crate::io_surface::SurfaceLease;
-use crate::{CompletionState, Error, Outcome, Request, SharedEvent};
+use crate::{CompletionState, Error, Request, SharedEvent};
 
 pub struct Completion {
     state: Mutex<CompletionState>,
@@ -35,7 +36,7 @@ impl Completion {
         &self,
         request: Arc<Request>,
         leases: Vec<SurfaceLease>,
-        outcome: Arc<Outcome>,
+        sink: Sink,
     ) -> Result<u64, Error> {
         let mut state = self.state.lock().map_err(|_| Error::Synchronization)?;
         if state.request.is_some() {
@@ -47,9 +48,17 @@ impl Completion {
             .ok_or(Error::Synchronization)?;
         state.leases = leases;
         state.request = Some(request);
-        state.outcome = Some(outcome);
+        state.sink = Some(sink);
         state.event_value = value;
         Ok(value)
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request
+            .is_none()
     }
 
     pub fn complete(&self, result: Result<(), Error>) {
@@ -58,15 +67,18 @@ impl Completion {
             return;
         };
         state.leases.clear();
-        let outcome = state.outcome.take();
+        let sink = state.sink.take();
         drop(state);
         if let Some(request) = Arc::into_inner(request) {
             self.cleanup
                 .send(request)
                 .unwrap_or_else(|_| panic!("ANE cleanup worker stopped"));
         }
-        if let Some(outcome) = outcome {
-            outcome.finish(result);
+        // After the state is released, so a callback can submit the request again.
+        match sink {
+            Some(Sink::Outcome(outcome)) => outcome.finish(result),
+            Some(Sink::Callback(callback)) => callback(result),
+            None => {}
         }
     }
 
@@ -74,8 +86,8 @@ impl Completion {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.leases.clear();
         let request = state.request.take();
-        let outcome = state.outcome.take();
+        let sink = state.sink.take();
         drop(state);
-        drop((request, outcome));
+        drop((request, sink));
     }
 }

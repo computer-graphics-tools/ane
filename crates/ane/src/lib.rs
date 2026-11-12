@@ -27,10 +27,12 @@ mod outcome;
 mod procedure;
 mod request;
 mod request_cache;
+mod request_slots;
 mod shared_event;
 mod state_data;
 mod submission;
 mod tensor_data;
+mod timeline;
 mod unavailable_interface;
 
 pub use apple_neural_engine::AneError;
@@ -52,11 +54,13 @@ pub use ops::{
     CoordinateMode, Palette, Palettization, Pooling2dDescriptor, ResizeSamplingMode,
     SamplingDescriptor, SamplingMode,
 };
+use request_slots::RequestSlots;
 pub use shared_event::{SharedEvent, SharedEventError};
 pub use submission::Submission;
 pub use tensor_data::{
     LockedSlice, LockedSliceMut, TensorData, TensorDataError, TensorElement, TensorSpec,
 };
+use timeline::{Timeline, Trip};
 pub use unavailable_interface::UnavailableInterface;
 
 use completion::Completion;

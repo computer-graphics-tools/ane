@@ -14,8 +14,9 @@ pub struct SharedEvent {
 
 impl SharedEvent {
     pub fn new() -> Result<Self, SharedEventError> {
-        // SAFETY: SurfaceEvent creates a native IOSurface shared event.
-        unsafe { Self::from_object(Retained::cast_unchecked(SurfaceEvent::new()?)) }
+        Ok(Self {
+            event: SurfaceEvent::new()?,
+        })
     }
 
     /// # Safety
