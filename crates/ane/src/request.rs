@@ -115,9 +115,7 @@ impl Request {
             .is_none_or(|completion| completion.is_idle())
     }
 
-    /// # Safety
-    /// The request must be idle. See [`BoundExecution::submit_ordered`](crate::BoundExecution::submit_ordered) for surface ordering.
-    pub unsafe fn submit_callback(
+    pub fn submit_callback(
         self: &Arc<Self>,
         descriptor: &ExecutionDescriptor<'_>,
         handler: CompletionHandler,

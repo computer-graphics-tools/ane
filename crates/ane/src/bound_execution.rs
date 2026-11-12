@@ -47,6 +47,6 @@ impl BoundExecution {
                 requests.len() - 1
             }
         };
-        unsafe { requests[index].submit_callback(descriptor, Box::new(on_complete)) }
+        requests[index].submit_callback(descriptor, Box::new(on_complete))
     }
 }
