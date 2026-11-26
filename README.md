@@ -37,6 +37,16 @@ The example binds an FP16 weight IOSurface as a variable, rewrites it from the C
 
 ![Mutable weights running on ANE](mutable-matmul.png)
 
+## W8A8 programs
+
+The experimental `metal` backend binds FFN and linear layers from group-32 RHT int4 weights.
+It accepts RowMajor, InterleavedRows, and MxuTiled packed-code layouts; the ANE runs W8A8 while
+Metal stages weights per call. Build it with `cargo +nightly build --release --features metal`.
+
+`Session::bind_*` is unsafe: W4 regions must be correctly sized, immutable, resident on the host
+device, and retained by the supplied owner. The unsafe `Queue` adapter must preserve resource
+hazards and event order through GPU completion.
+
 ## Research
 
 The ANE internals research behind this crate was inspired by Mohamed Ghannam's [weightBufs exploit chain](https://cra.sh/public_html/strlcpy3/iosmacos-exploit-chain-cve-2022-32845-32948-42805-32899-weightbufs) writeup, which documents the ANE architecture, the `aned` / `ANECompilerService` pipeline, and the kernel interface (`AppleH11ANEInterface`).

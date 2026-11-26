@@ -33,6 +33,8 @@ mod submission;
 mod submission_result;
 mod tensor_data;
 mod unavailable_interface;
+#[cfg(feature = "metal")]
+pub mod w8a8;
 
 pub use apple_neural_engine::AneError;
 pub use bound_execution::BoundExecution;

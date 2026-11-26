@@ -23,6 +23,11 @@ bytemuck.workspace = true
 serde.workspace = true
 plist.workspace = true
 
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "block2", "MTLBuffer", "MTLEvent", "MTLDevice", "MTLLibrary", "MTLComputePipeline", "MTL4ArgumentTable", "MTL4ComputeCommandEncoder", "MTL4CommandEncoder", "MTLCommandEncoder", "MTLTypes", "MTLResource", "MTLAllocation"], optional = true }
+
+[features]
+metal = ["dep:objc2-metal"]
+
 [dev-dependencies]
 rand.workspace = true
 

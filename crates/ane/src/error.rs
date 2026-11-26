@@ -47,6 +47,9 @@ pub enum Error {
     #[error(transparent)]
     SharedEvent(#[from] SharedEventError),
 
+    #[error("Metal: {0}")]
+    Metal(String),
+
     #[error("compiled {field} of {symbol} differs from the graph")]
     Layout { symbol: String, field: &'static str },
     #[error("invalid compiled program metadata: {0}")]
