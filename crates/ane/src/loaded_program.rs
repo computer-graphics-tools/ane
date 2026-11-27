@@ -1,8 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use objc2::rc::Retained;
-use objc2_foundation::{NSData, NSQualityOfService};
+use objc2_foundation::{NSData, NSQualityOfService, NSTemporaryDirectory};
 
 use crate::Error;
 use crate::apple_neural_engine::{
@@ -43,7 +43,8 @@ impl LoadedProgram {
         let text = NSData::from_vec(mil.text.into_bytes());
         let weights = NSData::from_vec(mil.weights);
         let program = ANEInMemoryModel::new(&*ANEInMemoryModelDescriptor::new(&text, &weights)?)?;
-        let directory = std::env::temp_dir().join(program.identifier()?);
+        let directory =
+            PathBuf::from(NSTemporaryDirectory().to_string()).join(program.identifier()?);
         let loaded: Result<(), Error> = (|| {
             if program.is_compiled() {
                 if program.load(qos).is_ok() {
