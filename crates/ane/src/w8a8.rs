@@ -16,3 +16,4 @@ pub use program::{Call, ExecutionError, Host, Layer, Queue, QueueScope, Session,
 pub use signs::RhtW4;
 
 const INPUT_CHANNELS: usize = 4096;
+const FFN_SHAPE_ALIGNMENT: usize = 512;

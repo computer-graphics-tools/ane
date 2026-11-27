@@ -9,7 +9,7 @@
 //! 2.0). Not affiliated with Splash.
 
 use super::{
-    INPUT_CHANNELS,
+    FFN_SHAPE_ALIGNMENT, INPUT_CHANNELS,
     signs::{intermediate_signs, signed_hadamard_blocks},
 };
 use crate::{
@@ -21,14 +21,15 @@ const INT8_SCALE: f32 = 1.0 / 128.0;
 const INT8_PEAK: f32 = 127.0;
 const MIN_TOKEN_PEAK: f32 = 1.0 / 512.0;
 const MATMUL_SEGMENT: usize = 2048;
-const INTERMEDIATE_ROTATION_BLOCK: usize = 512;
+const INTERMEDIATE_ROTATION_BLOCK: usize = FFN_SHAPE_ALIGNMENT;
 
 pub const TOKEN_COUNTS: [u32; 4] = [256, 512, 768, 1024];
 pub const MAX_TOKENS: usize = TOKEN_COUNTS[TOKEN_COUNTS.len() - 1] as usize;
 pub const UP_ROTATION_BLOCK: usize = 32;
+pub const MAX_FFN_HIDDEN: usize = 2 * INPUT_CHANNELS;
 /// The widest linear layer, in rows.
 pub const MAX_LINEAR_OUTPUT: usize = 16384;
-pub const MAX_INTERMEDIATE: usize = 3 * INPUT_CHANNELS;
+pub const MAX_INTERMEDIATE: usize = 5 * INPUT_CHANNELS;
 
 pub fn compile_ffn(hidden: usize, intermediate: usize) -> Result<Vec<Executable>, Error> {
     let graph = Graph::new();

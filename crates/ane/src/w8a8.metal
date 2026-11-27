@@ -10,6 +10,7 @@ using namespace metal;
 
 #define THREADS 256
 #define CHUNK 4096
+#define BLOCK 512
 #define TILE 32
 #define VALUES 16
 #define DOWN_BLOCK 512
@@ -77,6 +78,12 @@ static void block_hadamard_columns(
       values[2 * group + j] = column[group];
     }
   }
+}
+
+// Orthonormal basis block for widths that are not one 4096-value Hadamard chunk.
+static void block_hadamard_512(thread float* values, ushort lane) {
+  butterfly<VALUES>(values);
+  hadamard_across_lanes(values, lane, BLOCK / VALUES);
 }
 
 // `value` negated where bit `index` of `bits` is set (the +-1 sign vectors are stored as bit masks).
@@ -180,6 +187,60 @@ static float simdgroup_hadamard(ushort lane, float value) {
   }
 }
 
+struct BlockPackArguments {
+  uint width;
+  uint block_count;
+};
+
+// The shape uses an independent H512 per block so any multiple-of-512 width has an orthogonal basis.
+template <ushort BLOCKS_PER_SIMDGROUP>
+[[kernel, max_total_threads_per_threadgroup(THREADS)]] void pack_activations_blocks(
+    const device bfloat* input [[buffer(0)]],
+    const device float* signs [[buffer(1)]],
+    device char* codes [[buffer(2)]],
+    device half* token_scales [[buffer(3)]],
+    constant BlockPackArguments& arguments [[buffer(4)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_position_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partials[32];
+  float values[BLOCKS_PER_SIMDGROUP][VALUES];
+  float peak = 0.0f;
+  UNROLL
+  for (ushort slot = 0; slot < BLOCKS_PER_SIMDGROUP; ++slot) {
+    const uint block = simdgroup + slot * (THREADS / 32);
+    if (block < arguments.block_count) {
+      const uint base = block * BLOCK + lane * VALUES;
+      thread float* block_values = values[slot];
+      UNROLL
+      for (ushort index = 0; index < VALUES; ++index) {
+        block_values[index] = float(input[ulong(token) * arguments.width + base + index]) * signs[base + index];
+      }
+      block_hadamard_512(block_values, lane);
+      peak = max(peak, values_peak(block_values));
+    }
+  }
+
+  const float normalization = rsqrt(float(BLOCK));
+  const float row_peak = max(threadgroup_peak(peak, partials, lane, simdgroup) * normalization, 1e-20f);
+  const float inverse = 127.0f * normalization / row_peak;
+  UNROLL
+  for (ushort slot = 0; slot < BLOCKS_PER_SIMDGROUP; ++slot) {
+    const uint block = simdgroup + slot * (THREADS / 32);
+    if (block < arguments.block_count) {
+      const uint base = block * BLOCK + lane * VALUES;
+      store_codes(codes + ulong(token) * arguments.width + base, values[slot], inverse);
+    }
+  }
+  if (thread_id == 0) {
+    token_scales[token] = half(row_peak / 127.0f * 128.0f);
+  }
+}
+
+template [[host_name("pack_activations_blocks_1")]] kernel decltype(pack_activations_blocks<1>) pack_activations_blocks<1>;
+template [[host_name("pack_activations_blocks_2")]] kernel decltype(pack_activations_blocks<2>) pack_activations_blocks<2>;
+
 // Token-major int8 [tokens, 4096] -> channel-major surface rows [4096, row_stride], `row_stride` in
 // elements.
 struct TransposeArguments {
@@ -204,6 +265,42 @@ struct TransposeArguments {
     ushort value = 0;
     if (token_base + token < arguments.tokens) {
       value = ushort(uchar(codes[ulong(token_base + token) * CHUNK + channel_base + channel]));
+    }
+    tile[channel * (TILE + 1) + token] = value;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint index = thread_id; index < TILE * TILE; index += THREADS) {
+    const uint channel = index / TILE;
+    const uint token = index % TILE;
+    if (token_base + token < arguments.tokens) {
+      surface[ulong(channel_base + channel) * arguments.row_stride + token_base + token] =
+          char(tile[channel * (TILE + 1) + token]);
+    }
+  }
+}
+
+struct BlockTransposeArguments {
+  uint tokens;
+  uint row_stride;
+  uint width;
+};
+
+[[kernel, max_total_threads_per_threadgroup(THREADS)]] void transpose_codes_blocks(
+    const device char* codes [[buffer(0)]],
+    device char* surface [[buffer(1)]],
+    constant BlockTransposeArguments& arguments [[buffer(2)]],
+    uint3 tile_index [[threadgroup_position_in_grid]],
+    uint3 thread_index [[thread_position_in_threadgroup]]) {
+  threadgroup ushort tile[TILE * (TILE + 1)];
+  const uint thread_id = thread_index.x;
+  const uint channel_base = tile_index.x * TILE;
+  const uint token_base = tile_index.y * TILE;
+  for (uint index = thread_id; index < TILE * TILE; index += THREADS) {
+    const uint token = index / TILE;
+    const uint channel = index % TILE;
+    ushort value = 0;
+    if (token_base + token < arguments.tokens) {
+      value = ushort(uchar(codes[ulong(token_base + token) * arguments.width + channel_base + channel]));
     }
     tile[channel * (TILE + 1) + token] = value;
   }
@@ -402,6 +499,78 @@ static uint2 load_code_words(
   }
 }
 
+struct BlockStageArguments {
+  uint source_row_offset;
+  uint scale_stride;
+  uint staged_row_stride;
+  uint row_scale_stride;
+  uint code_row_words;
+  uint code_layout;
+  uint block_count;
+};
+
+template <ushort BLOCKS_PER_SIMDGROUP>
+[[kernel, max_total_threads_per_threadgroup(THREADS)]] void stage_up_rows_blocks(
+    const device uchar* weight_codes [[buffer(0)]],
+    const device bfloat* weight_scales [[buffer(1)]],
+    const device uchar* zero_points [[buffer(2)]],
+    const device float* pre_signs [[buffer(3)]],
+    device char* staged [[buffer(4)]],
+    device half* row_scales [[buffer(5)]],
+    constant BlockStageArguments& arguments [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_position_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partials[32];
+  const uint source_row = arguments.source_row_offset + row;
+  float values[BLOCKS_PER_SIMDGROUP][VALUES];
+  float peak = 0.0f;
+  UNROLL
+  for (ushort slot = 0; slot < BLOCKS_PER_SIMDGROUP; ++slot) {
+    const uint block = simdgroup + slot * (THREADS / 32);
+    if (block < arguments.block_count) {
+      const uint base = block * BLOCK + lane * VALUES;
+      const uint group = base / 32;
+      const float scale = float(weight_scales[ulong(group) * arguments.scale_stride + source_row]);
+      const float zero = float(
+          (zero_points[ulong(group) * (arguments.scale_stride / 2) + source_row / 2] >> ((source_row & 1) * 4)) & 0xF
+      );
+      const uint2 packed = load_code_words(weight_codes, source_row, base / 8, arguments.code_row_words, arguments.code_layout);
+      thread float* block_values = values[slot];
+      const float group_scale = dequantized_h32(block_values, packed, scale, zero, lane);
+      UNROLL
+      for (ushort index = 0; index < VALUES; index += 4) {
+        const float4 signs = *reinterpret_cast<const device float4*>(pre_signs + base + index) * group_scale;
+        block_values[index] *= signs.x;
+        block_values[index + 1] *= signs.y;
+        block_values[index + 2] *= signs.z;
+        block_values[index + 3] *= signs.w;
+      }
+      block_hadamard_512(block_values, lane);
+      peak = max(peak, values_peak(block_values));
+    }
+  }
+
+  const float normalization = rsqrt(float(BLOCK));
+  const float row_peak = max(threadgroup_peak(peak, partials, lane, simdgroup) * normalization, 1e-20f);
+  const float inverse = 127.0f * normalization / row_peak;
+  UNROLL
+  for (ushort slot = 0; slot < BLOCKS_PER_SIMDGROUP; ++slot) {
+    const uint block = simdgroup + slot * (THREADS / 32);
+    if (block < arguments.block_count) {
+      const uint base = block * BLOCK + lane * VALUES;
+      store_codes(staged + ulong(row) * arguments.staged_row_stride + base, values[slot], inverse);
+    }
+  }
+  if (thread_id == 0) {
+    row_scales[ulong(row) * arguments.row_scale_stride] = half(row_peak / 127.0f * 128.0f);
+  }
+}
+
+template [[host_name("stage_up_rows_blocks_1")]] kernel decltype(stage_up_rows_blocks<1>) stage_up_rows_blocks<1>;
+template [[host_name("stage_up_rows_blocks_2")]] kernel decltype(stage_up_rows_blocks<2>) stage_up_rows_blocks<2>;
+
 // Down projection: `CHUNKS` * 4096 columns (at most 3 chunks, held in registers) of source rows
 // addressed through `code_row_words`, block 512, with post signs. The +-1 sign vectors are bit masks: the float signs of a 12288-column
 // row (96 KB with both) did not stay cache resident and dominated the kernel.
@@ -468,6 +637,82 @@ template <ushort CHUNKS>
   }
 }
 
+struct BlockStageDownArguments {
+  uint scale_stride;
+  uint staged_row_stride;
+  uint row_scale_stride;
+  uint code_row_words;
+  uint code_layout;
+  uint block_count;
+};
+
+template <ushort BLOCKS_PER_SIMDGROUP>
+[[kernel, max_total_threads_per_threadgroup(THREADS)]] void stage_down_rows_blocks(
+    const device uchar* weight_codes [[buffer(0)]],
+    const device bfloat* weight_scales [[buffer(1)]],
+    const device uchar* zero_points [[buffer(2)]],
+    const device ushort* pre_sign_bits [[buffer(3)]],
+    const device ushort* post_sign_bits [[buffer(4)]],
+    device char* staged [[buffer(5)]],
+    device half* row_scales [[buffer(6)]],
+    constant BlockStageDownArguments& arguments [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_position_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partials[32];
+  const uint zero_shift = (row & 1) * 4;
+  float values[BLOCKS_PER_SIMDGROUP][VALUES];
+  float peak = 0.0f;
+  UNROLL
+  for (ushort slot = 0; slot < BLOCKS_PER_SIMDGROUP; ++slot) {
+    const uint block = simdgroup + slot * (THREADS / 32);
+    if (block < arguments.block_count) {
+      const uint base = block * BLOCK + lane * VALUES;
+      const uint group = base / 32;
+      const float scale = float(weight_scales[ulong(group) * arguments.scale_stride + row]);
+      const float zero = float(
+          (zero_points[ulong(group) * (arguments.scale_stride / 2) + row / 2] >> zero_shift) & 0xF
+      );
+      const uint2 packed = load_code_words(weight_codes, row, base / 8, arguments.code_row_words, arguments.code_layout);
+      thread float* block_values = values[slot];
+      const float group_scale = dequantized_h32(block_values, packed, scale, zero, lane);
+      const uint pre_bits = pre_sign_bits[base / VALUES];
+      UNROLL
+      for (ushort index = 0; index < VALUES; ++index) {
+        block_values[index] = flip_sign(block_values[index], pre_bits, index) * group_scale;
+      }
+      block_hadamard_512(block_values, lane);
+      const uint post_bits = post_sign_bits[base / VALUES];
+      UNROLL
+      for (ushort index = 0; index < VALUES; ++index) {
+        block_values[index] = flip_sign(block_values[index], post_bits, index);
+      }
+      peak = max(peak, values_peak(block_values));
+    }
+  }
+
+  const float normalization = rsqrt(float(BLOCK));
+  const float row_peak = max(threadgroup_peak(peak, partials, lane, simdgroup) * normalization, 1e-20f);
+  const float inverse = 127.0f * normalization / row_peak;
+  UNROLL
+  for (ushort slot = 0; slot < BLOCKS_PER_SIMDGROUP; ++slot) {
+    const uint block = simdgroup + slot * (THREADS / 32);
+    if (block < arguments.block_count) {
+      const uint base = block * BLOCK + lane * VALUES;
+      store_codes(staged + ulong(row) * arguments.staged_row_stride + base, values[slot], inverse);
+    }
+  }
+  if (thread_id == 0) {
+    row_scales[ulong(row) * arguments.row_scale_stride] = half(row_peak / 127.0f * 128.0f);
+  }
+}
+
 template [[host_name("stage_down_rows_1")]] kernel decltype(stage_down_rows<1>) stage_down_rows<1>;
 template [[host_name("stage_down_rows_2")]] kernel decltype(stage_down_rows<2>) stage_down_rows<2>;
 template [[host_name("stage_down_rows_3")]] kernel decltype(stage_down_rows<3>) stage_down_rows<3>;
+template [[host_name("stage_down_rows_blocks_1")]] kernel decltype(stage_down_rows_blocks<1>) stage_down_rows_blocks<1>;
+template [[host_name("stage_down_rows_blocks_2")]] kernel decltype(stage_down_rows_blocks<2>) stage_down_rows_blocks<2>;
+template [[host_name("stage_down_rows_blocks_3")]] kernel decltype(stage_down_rows_blocks<3>) stage_down_rows_blocks<3>;
+template [[host_name("stage_down_rows_blocks_4")]] kernel decltype(stage_down_rows_blocks<4>) stage_down_rows_blocks<4>;
+template [[host_name("stage_down_rows_blocks_5")]] kernel decltype(stage_down_rows_blocks<5>) stage_down_rows_blocks<5>;

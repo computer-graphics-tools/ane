@@ -1,6 +1,6 @@
 //! Deterministic program and layer rotation signs.
 
-use super::{INPUT_CHANNELS, kernels::W4};
+use super::kernels::W4;
 
 const SEED: u64 = 0x5eed_a11e_2026_1103;
 
@@ -48,8 +48,8 @@ pub fn intermediate_signs(intermediate: usize) -> Vec<f32> {
     random_signs(intermediate, 2)
 }
 
-pub fn pack_signs() -> Vec<f32> {
-    random_signs(INPUT_CHANNELS, 1)
+pub fn pack_signs(width: usize) -> Vec<f32> {
+    random_signs(width, 1)
 }
 
 /// Pack 16 signs per word; bit `i` is set when sign `i` is negative.
@@ -84,7 +84,7 @@ impl LayerSigns {
             pre: up
                 .input_signs
                 .iter()
-                .zip(pack_signs())
+                .zip(pack_signs(up.input_signs.len()))
                 .map(|(sign, pack)| *sign as f32 * pack)
                 .collect(),
             output: to_f32(down.unwrap_or(up).output_signs),

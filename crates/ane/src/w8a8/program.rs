@@ -13,13 +13,16 @@ use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_metal::MTLDevice;
 
 use super::{
-    INPUT_CHANNELS,
+    FFN_SHAPE_ALIGNMENT, INPUT_CHANNELS,
     gpu::{Buffer, Event, Residency},
     graph::{
-        MAX_INTERMEDIATE, MAX_LINEAR_OUTPUT, MAX_TOKENS, TOKEN_COUNTS, UP_ROTATION_BLOCK,
-        compile_ffn, compile_linear,
+        MAX_FFN_HIDDEN, MAX_INTERMEDIATE, MAX_LINEAR_OUTPUT, MAX_TOKENS, TOKEN_COUNTS,
+        UP_ROTATION_BLOCK, compile_ffn, compile_linear,
     },
-    kernels::{DownRegions, Kernels, Launch, LayerRegions, Region, Surface, W4, W4Layout},
+    kernels::{
+        DownRegions, Kernels, Launch, LayerRegions, PackDimensions, Region, Surface, UpStageRows,
+        W4, W4Layout,
+    },
     signs::{LayerSigns, RhtW4, intermediate_signs, pack_signs, sign_bits},
 };
 use crate::{
@@ -35,9 +38,11 @@ pub use session::Session;
 pub const TOKENS: RangeInclusive<u32> = 1..=TOKEN_COUNTS[TOKEN_COUNTS.len() - 1];
 
 fn fits_ffn(hidden: usize, intermediate: usize) -> bool {
-    hidden == INPUT_CHANNELS
+    hidden > 0
+        && hidden <= MAX_FFN_HIDDEN
+        && hidden.is_multiple_of(FFN_SHAPE_ALIGNMENT)
         && intermediate > 0
-        && intermediate.is_multiple_of(INPUT_CHANNELS)
+        && intermediate.is_multiple_of(FFN_SHAPE_ALIGNMENT)
         && intermediate <= MAX_INTERMEDIATE
 }
 
@@ -274,6 +279,8 @@ struct Program {
     host: Host,
     /// The width of the result (an FFN's is also that of its input).
     width: u32,
+    /// The width packed as input (linear projections retain the 4096-wide model input).
+    input_width: u32,
     /// Rows of each up matrix: the FFN's intermediate channels, a linear's output.
     channels: u32,
     _signs: Buffer,
@@ -283,6 +290,12 @@ struct Program {
     /// Counts the calls started: they alternate between the lanes.
     calls: AtomicUsize,
     retired: Arc<AtomicBool>,
+}
+
+struct ProgramWidths {
+    output: usize,
+    input: usize,
+    channels: usize,
 }
 
 impl Program {
@@ -300,8 +313,11 @@ impl Program {
         ];
         let signs = intermediate_signs(intermediate);
         Self::new(
-            hidden,
-            intermediate,
+            ProgramWidths {
+                output: hidden,
+                input: hidden,
+                channels: intermediate,
+            },
             &signs,
             &executables,
             surfaces,
@@ -325,12 +341,22 @@ impl Program {
             *shared = Some(lanes.clone());
             lanes
         };
-        Self::new(output, output, &[], &executables, surfaces, host, retired)
+        Self::new(
+            ProgramWidths {
+                output,
+                input: INPUT_CHANNELS,
+                channels: output,
+            },
+            &[],
+            &executables,
+            surfaces,
+            host,
+            retired,
+        )
     }
 
     fn new(
-        width: usize,
-        channels: usize,
+        widths: ProgramWidths,
         intermediate_signs: &[f32],
         executables: &[Executable],
         surfaces: [Arc<Surfaces>; 2],
@@ -343,14 +369,15 @@ impl Program {
             Lane::new(second, executables, host)?,
         ];
         let mut bytes = Vec::new();
-        let pack = append(&mut bytes, &pack_signs());
+        let pack = append(&mut bytes, &pack_signs(widths.input));
         let bits = append(&mut bytes, &sign_bits(intermediate_signs));
         let signs = host.upload(&bytes)?;
         let base = signs.region();
         Ok(Self {
             host: host.clone(),
-            width: width as u32,
-            channels: channels as u32,
+            width: widths.output as u32,
+            input_width: widths.input as u32,
+            channels: widths.channels as u32,
             pack_signs: slice(base, pack),
             intermediate_bits: slice(base, bits),
             _signs: signs,
@@ -413,8 +440,11 @@ impl Program {
                 layer.pre_signs,
                 &rows.weights,
                 &rows.scales,
-                index as u32 * layer.channels,
-                layer.channels,
+                UpStageRows {
+                    width: self.input_width,
+                    first_row: index as u32 * layer.channels,
+                    rows: layer.channels,
+                },
             );
             // SAFETY: the layer and lane keep the regions live through this encoding.
             unsafe { queue.execute(Step::Dispatch(launch)) }.map_err(ExecutionError::Queue)?;
@@ -492,7 +522,11 @@ impl Layer {
         if queue.device() != ptr::from_ref(&*program.host.device).cast_mut().cast() {
             return Err(Error::Metadata("queue belongs to another Metal device").into());
         }
-        let input = checked_region(queue, input, tokens as usize * INPUT_CHANNELS * 2)?;
+        let input = checked_region(
+            queue,
+            input,
+            tokens as usize * program.input_width as usize * 2,
+        )?;
         let lane = &program.lanes[program.calls.fetch_add(1, Ordering::Relaxed) % 2];
         let mut guard = lane
             .surfaces
@@ -514,7 +548,7 @@ impl Layer {
             .iter()
             .position(|rows| *rows >= tokens)
             .expect("token count is inside TOKENS");
-        let codes_len = tokens as usize * INPUT_CHANNELS;
+        let codes_len = tokens as usize * program.input_width as usize;
         let codes = queue.allocate(codes_len).map_err(ExecutionError::Queue)?;
         let packed = checked_region(queue, &codes, codes_len)?;
         let mut call = Call {
@@ -536,7 +570,10 @@ impl Layer {
             packed,
             &lane.surfaces.x,
             &lane.surfaces.tx,
-            tokens,
+            PackDimensions {
+                tokens,
+                width: program.input_width,
+            },
         ) {
             // SAFETY: validated buffers and the lane keep the regions live through this encoding.
             unsafe { queue.execute(Step::Dispatch(launch)) }.map_err(ExecutionError::Queue)?;

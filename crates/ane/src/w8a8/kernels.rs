@@ -22,6 +22,7 @@ const SOURCE: &str = include_str!("../w8a8.metal");
 const THREADS: usize = 256;
 /// Values in one Hadamard chunk.
 const CHUNK: u32 = INPUT_CHANNELS as u32;
+const BLOCK: u32 = 512;
 
 /// A GPU address and accessible byte length.
 #[derive(Clone, Copy, Debug)]
@@ -160,16 +161,32 @@ impl<'a> Launch<'a> {
 
 type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
+pub struct PackDimensions {
+    pub tokens: u32,
+    pub width: u32,
+}
+
+pub struct UpStageRows {
+    pub width: u32,
+    pub first_row: u32,
+    pub rows: u32,
+}
+
 /// Metal pipelines shared by programs on one device.
 #[derive(Clone)]
 pub struct Kernels {
     pack: Pipeline,
+    pack_blocks: [Pipeline; 2],
     transpose: Pipeline,
+    transpose_blocks: Pipeline,
     unpack: Pipeline,
     stage_gate_signs: Pipeline,
     stage_up: Pipeline,
+    stage_up_blocks: [Pipeline; 2],
     /// One per chunk count (1 to 3).
     stage_down: [Pipeline; 3],
+    /// One per number of 512-column blocks assigned to each simdgroup (1 to 5).
+    stage_down_blocks: [Pipeline; 5],
 }
 
 impl Kernels {
@@ -190,14 +207,30 @@ impl Kernels {
         };
         Ok(Self {
             pack: pipeline("pack_activations")?,
+            pack_blocks: [
+                pipeline("pack_activations_blocks_1")?,
+                pipeline("pack_activations_blocks_2")?,
+            ],
             transpose: pipeline("transpose_codes")?,
+            transpose_blocks: pipeline("transpose_codes_blocks")?,
             unpack: pipeline("unpack_activations")?,
             stage_gate_signs: pipeline("stage_gate_signs")?,
             stage_up: pipeline("stage_up_rows")?,
+            stage_up_blocks: [
+                pipeline("stage_up_rows_blocks_1")?,
+                pipeline("stage_up_rows_blocks_2")?,
+            ],
             stage_down: [
                 pipeline("stage_down_rows_1")?,
                 pipeline("stage_down_rows_2")?,
                 pipeline("stage_down_rows_3")?,
+            ],
+            stage_down_blocks: [
+                pipeline("stage_down_rows_blocks_1")?,
+                pipeline("stage_down_rows_blocks_2")?,
+                pipeline("stage_down_rows_blocks_3")?,
+                pipeline("stage_down_rows_blocks_4")?,
+                pipeline("stage_down_rows_blocks_5")?,
             ],
         })
     }
@@ -210,27 +243,52 @@ impl Kernels {
         codes: Region,
         x: &Surface,
         tx: &Surface,
-        tokens: u32,
+        dimensions: PackDimensions,
     ) -> [Launch<'_>; 2] {
+        let PackDimensions { tokens, width } = dimensions;
         let tiles = (tokens as usize).div_ceil(32);
-        [
-            Launch::new(
-                "AnePack",
-                &self.pack,
-                &[input, signs],
-                &[codes, tx.region],
-                &[],
-                [tokens as usize, 1, 1],
-            ),
-            Launch::new(
-                "AneTranspose",
-                &self.transpose,
-                &[codes],
-                &[x.region],
-                &[tokens, x.row_stride],
-                [CHUNK as usize / 32, tiles, 1],
-            ),
-        ]
+        if width == CHUNK {
+            [
+                Launch::new(
+                    "AnePack",
+                    &self.pack,
+                    &[input, signs],
+                    &[codes, tx.region],
+                    &[],
+                    [tokens as usize, 1, 1],
+                ),
+                Launch::new(
+                    "AneTranspose",
+                    &self.transpose,
+                    &[codes],
+                    &[x.region],
+                    &[tokens, x.row_stride],
+                    [CHUNK as usize / 32, tiles, 1],
+                ),
+            ]
+        } else {
+            let blocks = width / BLOCK;
+            let blocks_per_simdgroup = blocks.div_ceil((THREADS / 32) as u32);
+            let pipeline_index = (blocks_per_simdgroup - 1) as usize;
+            [
+                Launch::new(
+                    "AnePack",
+                    &self.pack_blocks[pipeline_index],
+                    &[input, signs],
+                    &[codes, tx.region],
+                    &[width, blocks],
+                    [tokens as usize, 1, 1],
+                ),
+                Launch::new(
+                    "AneTranspose",
+                    &self.transpose_blocks,
+                    &[codes],
+                    &[x.region],
+                    &[tokens, x.row_stride, width],
+                    [width as usize / 32, tiles, 1],
+                ),
+            ]
+        }
     }
 
     /// Unpacks results to token-major bf16, applying token/intermediate scales and output signs.
@@ -272,35 +330,63 @@ impl Kernels {
         )
     }
 
-    /// Stages rows of the 4096-column up projection, applying signs and per-row quantization.
+    /// Stages rows of the up projection, applying signs and per-row quantization.
     pub fn stage_up(
         &self,
         w4: W4,
         pre_signs: Region,
         weights: &Surface,
         scales: &Surface,
-        first_row: u32,
-        rows: u32,
+        rows: UpStageRows,
     ) -> Launch<'_> {
+        let UpStageRows {
+            width,
+            first_row,
+            rows,
+        } = rows;
+        let blocks = width / BLOCK;
+        let code_row_words = width / 8;
         let constants = [
             first_row,
             w4.scale_stride,
             weights.row_stride,
             scales.row_stride,
-            CHUNK / 8,
+            code_row_words,
             w4.layout as u32,
         ];
-        Launch::new(
-            "AneStageUp",
-            &self.stage_up,
-            &[w4.codes, w4.scales, w4.zero_points, pre_signs],
-            &[weights.region, scales.region],
-            &constants,
-            [rows as usize, 1, 1],
-        )
+        if width == CHUNK {
+            Launch::new(
+                "AneStageUp",
+                &self.stage_up,
+                &[w4.codes, w4.scales, w4.zero_points, pre_signs],
+                &[weights.region, scales.region],
+                &constants,
+                [rows as usize, 1, 1],
+            )
+        } else {
+            let blocks_per_simdgroup = blocks.div_ceil((THREADS / 32) as u32);
+            let pipeline_index = (blocks_per_simdgroup - 1) as usize;
+            let block_constants = [
+                first_row,
+                w4.scale_stride,
+                weights.row_stride,
+                scales.row_stride,
+                code_row_words,
+                w4.layout as u32,
+                blocks,
+            ];
+            Launch::new(
+                "AneStageUp",
+                &self.stage_up_blocks[pipeline_index],
+                &[w4.codes, w4.scales, w4.zero_points, pre_signs],
+                &[weights.region, scales.region],
+                &block_constants,
+                [rows as usize, 1, 1],
+            )
+        }
     }
 
-    /// Stages down-projection rows from one to three 4096-column chunks, with per-row quantization.
+    /// Stages down-projection rows, with per-row quantization.
     pub fn stage_down(
         &self,
         down: &DownRegions,
@@ -317,19 +403,47 @@ impl Kernels {
             columns / 8,
             w4.layout as u32,
         ];
-        Launch::new(
-            "AneStageDown",
-            &self.stage_down[(columns / CHUNK - 1) as usize],
-            &[
-                w4.codes,
-                w4.scales,
-                w4.zero_points,
-                down.pre_bits,
-                down.intermediate_bits,
-            ],
-            &[weights.region, scales.region],
-            &constants,
-            [hidden as usize, 1, 1],
-        )
+        if columns.is_multiple_of(CHUNK) && columns / CHUNK <= self.stage_down.len() as u32 {
+            Launch::new(
+                "AneStageDown",
+                &self.stage_down[(columns / CHUNK - 1) as usize],
+                &[
+                    w4.codes,
+                    w4.scales,
+                    w4.zero_points,
+                    down.pre_bits,
+                    down.intermediate_bits,
+                ],
+                &[weights.region, scales.region],
+                &constants,
+                [hidden as usize, 1, 1],
+            )
+        } else {
+            let blocks = columns / BLOCK;
+            let blocks_per_simdgroup = blocks.div_ceil((THREADS / 32) as u32);
+            let pipeline_index = (blocks_per_simdgroup - 1) as usize;
+            let block_constants = [
+                w4.scale_stride,
+                weights.row_stride,
+                scales.row_stride,
+                columns / 8,
+                w4.layout as u32,
+                blocks,
+            ];
+            Launch::new(
+                "AneStageDown",
+                &self.stage_down_blocks[pipeline_index],
+                &[
+                    w4.codes,
+                    w4.scales,
+                    w4.zero_points,
+                    down.pre_bits,
+                    down.intermediate_bits,
+                ],
+                &[weights.region, scales.region],
+                &block_constants,
+                [hidden as usize, 1, 1],
+            )
+        }
     }
 }
