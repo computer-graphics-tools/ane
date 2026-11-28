@@ -1,18 +1,8 @@
 //! Deterministic program and layer rotation signs.
 
-use super::kernels::W4;
+use super::kernels::WeightLayer;
 
 const SEED: u64 = 0x5eed_a11e_2026_1103;
-
-/// An RHT int4 matrix and the signs for `R_out W R_in^T` (signed block-32 Hadamard rotations).
-/// `w4.layout` describes the source code order; staging preserves its logical rows and columns.
-pub struct RhtW4<'a> {
-    pub w4: W4,
-    /// Input signs, one per column.
-    pub input_signs: &'a [i32],
-    /// Output signs, one per row.
-    pub output_signs: &'a [i32],
-}
 
 fn random_signs(count: usize, salt: u64) -> Vec<f32> {
     let mut state = SEED ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -74,33 +64,54 @@ pub struct LayerSigns {
     pub gate: Vec<f32>,
     /// Down-input signs times value-output signs, packed as bits; empty for a linear layer.
     pub pre_bits: Vec<u16>,
+    /// The same down-input signs in float form for compact-source staging.
+    pub down_pre: Vec<f32>,
 }
 
 impl LayerSigns {
-    pub fn new(up: &RhtW4, down: Option<&RhtW4>) -> Self {
+    pub fn new(up: &WeightLayer<'_>, down: Option<&WeightLayer<'_>>) -> Self {
         let to_f32 =
             |signs: &[i32]| -> Vec<f32> { signs.iter().map(|sign| *sign as f32).collect() };
+        let identity = |count: usize| vec![1.0; count];
+        let up_output = up.output_rotation.map_or_else(
+            || identity(up.rows as usize),
+            |rotation| to_f32(rotation.signs),
+        );
+        let output = match down {
+            Some(down) => down.output_rotation.map_or_else(
+                || identity(down.rows as usize),
+                |rotation| to_f32(rotation.signs),
+            ),
+            None => up.output_rotation.map_or_else(
+                || identity(up.rows as usize),
+                |rotation| to_f32(rotation.signs),
+            ),
+        };
         let mut signs = Self {
             pre: up
-                .input_signs
+                .input_rotation
+                .signs
                 .iter()
-                .zip(pack_signs(up.input_signs.len()))
+                .zip(pack_signs(up.input_rotation.signs.len()))
                 .map(|(sign, pack)| *sign as f32 * pack)
                 .collect(),
-            output: to_f32(down.unwrap_or(up).output_signs),
+            output,
             gate: Vec::new(),
             pre_bits: Vec::new(),
+            down_pre: Vec::new(),
         };
         if let Some(down) = down {
-            let (value, gate) = up.output_signs.split_at(down.input_signs.len());
+            let (value, gate) = up_output.split_at(down.input_rotation.signs.len());
             let pre_signs: Vec<f32> = down
-                .input_signs
+                .input_rotation
+                .signs
                 .iter()
                 .zip(value)
-                .map(|(down, value)| (down * value) as f32)
+                .map(|(down, value)| *down as f32 * value)
                 .collect();
-            signs.gate = to_f32(gate);
+            signs.gate = gate.to_vec();
             signs.pre_bits = sign_bits(&pre_signs);
+            signs.down_pre = pre_signs;
         }
         signs
     }

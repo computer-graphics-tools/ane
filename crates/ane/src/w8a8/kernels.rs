@@ -6,19 +6,28 @@
 //! zero points are `[columns / 32, scale_stride / 2]` (even row in the low nibble). Values dequantize
 //! as `scale * (code - zero_point)`.
 
-use std::ffi::c_void;
+use std::{
+    collections::HashMap,
+    ffi::c_void,
+    ptr::NonNull,
+    sync::{Arc, Mutex},
+};
 
-use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ComputeCommandEncoder, MTLCompileOptions, MTLComputePipelineState,
-    MTLDevice, MTLLanguageVersion, MTLLibrary, MTLSize,
+    MTLDataType, MTLDevice, MTLFunctionConstantValues, MTLLanguageVersion, MTLLibrary, MTLSize,
 };
 
 use super::{INPUT_CHANNELS, gpu::Buffer};
 use crate::TensorData;
 
-const SOURCE: &str = include_str!("../w8a8.metal");
+const SOURCE: &str = concat!(
+    include_str!("../w8a8.metal"),
+    "\n",
+    include_str!("stage_compact.metal")
+);
 const THREADS: usize = 256;
 /// Values in one Hadamard chunk.
 const CHUNK: u32 = INPUT_CHANNELS as u32;
@@ -41,6 +50,21 @@ pub enum W4Layout {
     MxuTiled,
 }
 
+/// Layout of compact U8 and U2 source codes after activation preparation.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WeightCodeLayout {
+    #[default]
+    RowMajor,
+    MxuTiled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum OutputBasis {
+    Identity,
+    Hadamard32,
+}
+
 /// An ANE tensor, its Metal alias, and its row stride in elements.
 pub struct Surface {
     /// Must drop before the memory it aliases.
@@ -60,15 +84,57 @@ pub struct W4 {
     pub layout: W4Layout,
 }
 
+/// A compact source matrix that the queue adapter decodes into reusable ANE rows.
+#[derive(Clone, Copy, Debug)]
+pub enum WeightSource {
+    W4(W4),
+    SymmetricU8 {
+        codes: Region,
+        scales: Region,
+        scale_stride: u32,
+        group_size: u32,
+        layout: WeightCodeLayout,
+        signed_codes: bool,
+    },
+    MlxU2ScaleBias {
+        codes: Region,
+        scales: Region,
+        biases: Region,
+        scale_stride: u32,
+        group_size: u32,
+        layout: WeightCodeLayout,
+        signed_codes: bool,
+    },
+}
+
+/// One compact source matrix and the transforms that give it its model basis.
+#[derive(Clone, Copy)]
+pub struct WeightLayer<'a> {
+    pub source: WeightSource,
+    pub rows: u32,
+    pub columns: u32,
+    pub input_rotation: Rotation<'a>,
+    pub output_rotation: Option<Rotation<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Rotation<'a> {
+    pub block_size: u32,
+    pub signs: &'a [i32],
+}
+
 /// RHT int4 weights and their sign vectors (`f32` unless noted).
 #[derive(Clone, Copy, Debug)]
 pub struct LayerRegions {
     /// Fused value/gate rows for an FFN, or the linear weights.
-    pub up: W4,
+    pub up: WeightSource,
     /// Signs applied while staging the up rows.
     pub pre_signs: Region,
     /// Signs applied when unpacking.
     pub output_signs: Region,
+    pub output_basis: OutputBasis,
+    /// Source input rotation width for the up projection.
+    pub input_block: u32,
     /// Up rows: FFN intermediate channels or linear outputs.
     pub channels: u32,
     /// FFN hidden width or linear input width.
@@ -80,7 +146,10 @@ pub struct LayerRegions {
 /// FFN down-projection data.
 #[derive(Clone, Copy, Debug)]
 pub struct DownRegions {
-    pub w4: W4,
+    pub source: WeightSource,
+    pub input_block: u32,
+    pub pre_signs: Region,
+    pub post_signs: Region,
     /// Gate output signs (`f32`).
     pub gate_signs: Region,
     /// Down input signs times value output signs, packed as bits.
@@ -90,10 +159,10 @@ pub struct DownRegions {
 }
 
 /// One compute dispatch for the host adapter to encode.
-pub struct Launch<'a> {
+pub struct Launch {
     /// Trace label.
     pub name: &'static str,
-    pipeline: &'a ProtocolObject<dyn MTLComputePipelineState>,
+    pipeline: Pipeline,
     /// Argument regions and write flags, in shader order. The adapter must honor these hazards.
     pub buffers: Vec<(Region, bool)>,
     /// Values read after the buffer arguments; empty if the shader has no constants.
@@ -101,11 +170,11 @@ pub struct Launch<'a> {
     groups: [usize; 3],
 }
 
-impl<'a> Launch<'a> {
+impl Launch {
     /// Builds a launch from its read/write regions and grid.
     fn new(
         name: &'static str,
-        pipeline: &'a Pipeline,
+        pipeline: &Pipeline,
         reads: &[Region],
         writes: &[Region],
         constants: &[u32],
@@ -115,7 +184,7 @@ impl<'a> Launch<'a> {
         let buffers = buffers.chain(writes.iter().map(|region| (*region, true)));
         Self {
             name,
-            pipeline,
+            pipeline: pipeline.clone(),
             buffers: buffers.collect(),
             constants: constants.to_vec(),
             groups,
@@ -142,7 +211,7 @@ impl<'a> Launch<'a> {
             unsafe { table.setAddress_atIndex(region.address, index) };
         }
         unsafe { table.setAddress_atIndex(constants, self.buffers.len()) };
-        encoder.setComputePipelineState(self.pipeline);
+        encoder.setComputePipelineState(&self.pipeline);
         let [width, height, depth] = self.groups;
         encoder.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
@@ -161,6 +230,106 @@ impl<'a> Launch<'a> {
 
 type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct StageKey {
+    source_format: u32,
+    source_layout: u32,
+    signed_codes: bool,
+    source_block: u32,
+    target_block: u32,
+    has_post_signs: bool,
+    blocks_per_simdgroup: u32,
+}
+
+fn stage_key(
+    source: WeightSource,
+    columns: u32,
+    source_block: u32,
+    target_block: u32,
+    has_post_signs: bool,
+) -> Result<Option<StageKey>, String> {
+    let (source_format, layout, signed_codes) = match source {
+        WeightSource::W4(_) => return Ok(None),
+        WeightSource::SymmetricU8 {
+            layout,
+            signed_codes,
+            ..
+        } => (0, layout, signed_codes),
+        WeightSource::MlxU2ScaleBias {
+            layout,
+            signed_codes,
+            ..
+        } => (1, layout, signed_codes),
+    };
+    if !matches!(source_block, 32 | 128) {
+        return Err(format!("unsupported ANE stage source block {source_block}"));
+    }
+    let blocks_per_simdgroup = match target_block {
+        CHUNK if columns == CHUNK && !has_post_signs => 1,
+        CHUNK => return Err(format!("unsupported ANE up-stage shape {columns}")),
+        BLOCK if columns > 0 && columns.is_multiple_of(BLOCK) => columns.div_ceil(CHUNK),
+        BLOCK => return Err(format!("unsupported ANE down-stage shape {columns}")),
+        _ => return Err(format!("unsupported ANE target block {target_block}")),
+    };
+    if !(1..=5).contains(&blocks_per_simdgroup) {
+        return Err(format!("unsupported ANE down-stage shape {columns}"));
+    }
+    Ok(Some(StageKey {
+        source_format,
+        source_layout: layout as u32,
+        signed_codes,
+        source_block,
+        target_block,
+        has_post_signs,
+        blocks_per_simdgroup,
+    }))
+}
+
+fn stage_source_regions(
+    source: WeightSource,
+) -> Result<(Region, Region, Region, u32, u32), String> {
+    match source {
+        WeightSource::W4(_) => Err("W4 weights use the existing ANE staging kernels".into()),
+        WeightSource::SymmetricU8 {
+            codes,
+            scales,
+            scale_stride,
+            group_size,
+            ..
+        } => Ok((codes, scales, scales, scale_stride, group_size)),
+        WeightSource::MlxU2ScaleBias {
+            codes,
+            scales,
+            biases,
+            scale_stride,
+            group_size,
+            ..
+        } => Ok((codes, scales, biases, scale_stride, group_size)),
+    }
+}
+
+fn set_stage_u32(values: &MTLFunctionConstantValues, value: u32, index: usize) {
+    // SAFETY: the value pointer is valid for the duration of this synchronous setter call.
+    unsafe {
+        values.setConstantValue_type_atIndex(
+            NonNull::from(&value).cast(),
+            MTLDataType::UInt,
+            index,
+        );
+    }
+}
+
+fn set_stage_bool(values: &MTLFunctionConstantValues, value: bool, index: usize) {
+    // SAFETY: the value pointer is valid for the duration of this synchronous setter call.
+    unsafe {
+        values.setConstantValue_type_atIndex(
+            NonNull::from(&value).cast(),
+            MTLDataType::Bool,
+            index,
+        );
+    }
+}
+
 pub struct PackDimensions {
     pub tokens: u32,
     pub width: u32,
@@ -172,14 +341,28 @@ pub struct UpStageRows {
     pub rows: u32,
 }
 
+pub struct CompactStageRows {
+    pub source_row_offset: u32,
+    pub rows: u32,
+    pub columns: u32,
+    pub source_block: u32,
+    pub pre_signs: Region,
+    pub target_block: u32,
+    pub post_signs: Option<Region>,
+}
+
 /// Metal pipelines shared by programs on one device.
 #[derive(Clone)]
 pub struct Kernels {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    compact_stage: Arc<Mutex<HashMap<StageKey, Pipeline>>>,
     pack: Pipeline,
     pack_blocks: [Pipeline; 2],
     transpose: Pipeline,
     transpose_blocks: Pipeline,
     unpack: Pipeline,
+    unpack_identity: Pipeline,
     stage_gate_signs: Pipeline,
     stage_up: Pipeline,
     stage_up_blocks: [Pipeline; 2],
@@ -206,6 +389,9 @@ impl Kernels {
                 .map_err(|error| error.to_string())
         };
         Ok(Self {
+            device: device.retain(),
+            library: library.clone(),
+            compact_stage: Arc::new(Mutex::new(HashMap::new())),
             pack: pipeline("pack_activations")?,
             pack_blocks: [
                 pipeline("pack_activations_blocks_1")?,
@@ -214,6 +400,7 @@ impl Kernels {
             transpose: pipeline("transpose_codes")?,
             transpose_blocks: pipeline("transpose_codes_blocks")?,
             unpack: pipeline("unpack_activations")?,
+            unpack_identity: pipeline("unpack_activations_identity")?,
             stage_gate_signs: pipeline("stage_gate_signs")?,
             stage_up: pipeline("stage_up_rows")?,
             stage_up_blocks: [
@@ -235,6 +422,109 @@ impl Kernels {
         })
     }
 
+    /// Prepares the one compact source/transform variant needed by a model layer.
+    pub fn prepare_weight_stage(
+        &self,
+        source: WeightSource,
+        columns: u32,
+        source_block: u32,
+        target_block: u32,
+        has_post_signs: bool,
+    ) -> Result<(), String> {
+        let Some(key) = stage_key(source, columns, source_block, target_block, has_post_signs)?
+        else {
+            return Ok(());
+        };
+        let mut cache = self
+            .compact_stage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if cache.contains_key(&key) {
+            return Ok(());
+        }
+
+        let values = MTLFunctionConstantValues::new();
+        set_stage_u32(&values, key.source_format, 0);
+        set_stage_u32(&values, key.source_layout, 1);
+        set_stage_bool(&values, key.signed_codes, 2);
+        set_stage_u32(&values, key.source_block, 3);
+        set_stage_bool(&values, key.has_post_signs, 4);
+        let name = if key.target_block == CHUNK {
+            "stage_compact_up_rows".to_string()
+        } else {
+            format!(
+                "stage_compact_down_rows_blocks_{}",
+                key.blocks_per_simdgroup
+            )
+        };
+        let function = self
+            .library
+            .newFunctionWithName_constantValues_error(&NSString::from_str(&name), &values)
+            .map_err(|error| error.to_string())?;
+        let pipeline = self
+            .device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|error| error.to_string())?;
+        cache.insert(key, pipeline);
+        Ok(())
+    }
+
+    /// Builds a dispatch using a variant prepared during model binding.
+    pub fn stage_weight(
+        &self,
+        source: WeightSource,
+        stage: CompactStageRows,
+        weights: &Surface,
+        scales: &Surface,
+    ) -> Result<Launch, String> {
+        let CompactStageRows {
+            source_row_offset,
+            rows,
+            columns,
+            source_block,
+            pre_signs,
+            target_block,
+            post_signs,
+        } = stage;
+        let key = stage_key(
+            source,
+            columns,
+            source_block,
+            target_block,
+            post_signs.is_some(),
+        )?
+        .ok_or_else(|| "W4 weights use the existing ANE staging kernels".to_string())?;
+        let pipeline = self
+            .compact_stage
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| {
+                "compact weight staging variant was not prepared at bind time".to_string()
+            })?;
+        let (codes, source_scales, biases, scale_stride, group_size) =
+            stage_source_regions(source)?;
+        let post_signs = post_signs.unwrap_or(pre_signs);
+        let constants = [
+            source_row_offset,
+            rows,
+            columns,
+            scale_stride,
+            group_size,
+            weights.row_stride,
+            scales.row_stride,
+        ];
+        Ok(Launch::new(
+            "AneStageCompact",
+            &pipeline,
+            &[codes, source_scales, biases, pre_signs, post_signs],
+            &[weights.region, scales.region],
+            &constants,
+            [rows as usize, 1, 1],
+        ))
+    }
+
     /// Packs token-major bf16 input into signed Hadamard int8 codes and token scales.
     pub fn pack(
         &self,
@@ -244,7 +534,7 @@ impl Kernels {
         x: &Surface,
         tx: &Surface,
         dimensions: PackDimensions,
-    ) -> [Launch<'_>; 2] {
+    ) -> [Launch; 2] {
         let PackDimensions { tokens, width } = dimensions;
         let tiles = (tokens as usize).div_ceil(32);
         if width == CHUNK {
@@ -300,7 +590,7 @@ impl Kernels {
         tx: &Surface,
         output: Region,
         tokens: u32,
-    ) -> Launch<'_> {
+    ) -> Launch {
         let constants = [
             layer.width,
             tokens,
@@ -308,18 +598,28 @@ impl Kernels {
             layer.down.is_some() as u32,
         ];
         let groups = [layer.width as usize / 32, (tokens as usize).div_ceil(32), 1];
-        Launch::new(
-            "AneUnpack",
-            &self.unpack,
-            &[y.region, tx.region, layer.output_signs],
-            &[output],
-            &constants,
-            groups,
-        )
+        match layer.output_basis {
+            OutputBasis::Hadamard32 => Launch::new(
+                "AneUnpack",
+                &self.unpack,
+                &[y.region, tx.region, layer.output_signs],
+                &[output],
+                &constants,
+                groups,
+            ),
+            OutputBasis::Identity => Launch::new(
+                "AneUnpackIdentity",
+                &self.unpack_identity,
+                &[y.region, tx.region],
+                &[output],
+                &constants,
+                groups,
+            ),
+        }
     }
 
     /// Writes half-scaled gate signs to the FFN surface.
-    pub fn stage_gate_signs(&self, signs: Region, zg: &Surface, rows: u32) -> Launch<'_> {
+    pub fn stage_gate_signs(&self, signs: Region, zg: &Surface, rows: u32) -> Launch {
         Launch::new(
             "AneStageGateSigns",
             &self.stage_gate_signs,
@@ -338,7 +638,7 @@ impl Kernels {
         weights: &Surface,
         scales: &Surface,
         rows: UpStageRows,
-    ) -> Launch<'_> {
+    ) -> Launch {
         let UpStageRows {
             width,
             first_row,
@@ -394,8 +694,10 @@ impl Kernels {
         scales: &Surface,
         hidden: u32,
         columns: u32,
-    ) -> Launch<'_> {
-        let w4 = down.w4;
+    ) -> Launch {
+        let WeightSource::W4(w4) = down.source else {
+            unreachable!("the W4 down staging path only accepts W4 sources")
+        };
         let constants = [
             w4.scale_stride,
             weights.row_stride,

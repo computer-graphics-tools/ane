@@ -11,9 +11,11 @@ mod program;
 mod signs;
 
 pub use gpu::{Event, Residency};
-pub use kernels::{Launch, Region, W4, W4Layout};
+pub use kernels::{
+    Launch, OutputBasis, Region, Rotation, W4, W4Layout, WeightCodeLayout, WeightLayer,
+    WeightSource,
+};
 pub use program::{Call, ExecutionError, Host, Layer, Queue, QueueScope, Session, Step, TOKENS};
-pub use signs::RhtW4;
 
 const INPUT_CHANNELS: usize = 4096;
 const FFN_SHAPE_ALIGNMENT: usize = 512;

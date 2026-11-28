@@ -3,14 +3,23 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use super::{Host, Layer, Program, Surfaces, fits_ffn, fits_linear, valid_w4};
-use crate::w8a8::RhtW4;
-use crate::{AneError, Error, SharedEventError};
+use super::super::{FFN_SHAPE_ALIGNMENT, INPUT_CHANNELS};
+use super::{Host, Layer, Program, Surfaces, fits_ffn, fits_linear, valid_weight_layer};
+use crate::{
+    AneError, Error, SharedEventError,
+    w8a8::{OutputBasis, WeightLayer},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Shape {
-    Ffn { hidden: usize, intermediate: usize },
-    Linear { output: usize },
+    Ffn {
+        hidden: usize,
+        intermediate: usize,
+        up_output_basis: OutputBasis,
+    },
+    Linear {
+        output: usize,
+    },
 }
 
 #[derive(Default)]
@@ -32,57 +41,102 @@ impl Session {
     /// Binds an FFN layer when its shape is supported.
     ///
     /// # Safety
-    /// W4 regions must be correctly sized, immutable, resident on the host device, and owned
-    /// by `owner`. The layer retains that owner through every call.
+    /// Compact weight regions and rotations must be correctly sized, immutable, resident on the
+    /// host device, and owned by `owner`. The layer retains that owner through every call.
     pub unsafe fn bind_ffn(
         &self,
-        up: &RhtW4,
-        down: &RhtW4,
+        up: &WeightLayer<'_>,
+        down: &WeightLayer<'_>,
         owner: Arc<dyn Send + Sync>,
         host_factory: impl FnOnce() -> Result<Host, Error>,
     ) -> Result<Option<Layer>, Error> {
-        let hidden = up.input_signs.len();
-        let intermediate = up.output_signs.len() / 2;
-        if up.output_signs.len() != intermediate * 2
-            || down.output_signs.len() != hidden
-            || down.input_signs.len() != intermediate
+        let hidden = up.columns as usize;
+        let intermediate = up.rows as usize / 2;
+        if up.rows as usize != intermediate.saturating_mul(2)
+            || down.rows as usize != hidden
+            || down.columns as usize != intermediate
             || !fits_ffn(hidden, intermediate)
-            || !valid_w4(up.w4, up.output_signs.len(), hidden)
-            || !valid_w4(down.w4, hidden, intermediate)
+            || !valid_weight_layer(up)
+            || !valid_weight_layer(down)
         {
             return Ok(None);
         }
 
+        let up_output_basis = output_basis(up);
+        let layer_output_basis = output_basis(down);
+
         let shape = Shape::Ffn {
             hidden,
             intermediate,
+            up_output_basis,
         };
-        let Some(program) = self.program(shape, host_factory)? else {
+        let up_target_block = if hidden == INPUT_CHANNELS {
+            INPUT_CHANNELS as u32
+        } else {
+            FFN_SHAPE_ALIGNMENT as u32
+        };
+        let Some(program) = self.program(shape, host_factory, |host| {
+            host.kernels
+                .prepare_weight_stage(
+                    up.source,
+                    up.columns,
+                    up.input_rotation.block_size,
+                    up_target_block,
+                    false,
+                )
+                .map_err(Error::Metal)?;
+            host.kernels
+                .prepare_weight_stage(
+                    down.source,
+                    down.columns,
+                    down.input_rotation.block_size,
+                    FFN_SHAPE_ALIGNMENT as u32,
+                    true,
+                )
+                .map_err(Error::Metal)
+        })?
+        else {
             return Ok(None);
         };
-        program.bind_layer(up, Some(down), owner).map(Some)
+        program
+            .bind_layer(up, Some(down), layer_output_basis, owner)
+            .map(Some)
     }
 
     /// Binds a linear layer when its shape is supported.
     ///
     /// # Safety
-    /// W4 regions must be correctly sized, immutable, resident on the host device, and owned
-    /// by `owner`. The layer retains that owner through every call.
+    /// Compact weight regions and rotations must be correctly sized, immutable, resident on the
+    /// host device, and owned by `owner`. The layer retains that owner through every call.
     pub unsafe fn bind_linear(
         &self,
-        weights: &RhtW4,
+        weights: &WeightLayer<'_>,
         owner: Arc<dyn Send + Sync>,
         host_factory: impl FnOnce() -> Result<Host, Error>,
     ) -> Result<Option<Layer>, Error> {
-        let (input, output) = (weights.input_signs.len(), weights.output_signs.len());
-        if !fits_linear(input, output) || !valid_w4(weights.w4, output, input) {
+        let (input, output) = (weights.columns as usize, weights.rows as usize);
+        if !fits_linear(input, output) || !valid_weight_layer(weights) {
             return Ok(None);
         }
 
-        let Some(program) = self.program(Shape::Linear { output }, host_factory)? else {
+        let layer_output_basis = output_basis(weights);
+        let Some(program) = self.program(Shape::Linear { output }, host_factory, |host| {
+            host.kernels
+                .prepare_weight_stage(
+                    weights.source,
+                    weights.columns,
+                    weights.input_rotation.block_size,
+                    INPUT_CHANNELS as u32,
+                    false,
+                )
+                .map_err(Error::Metal)
+        })?
+        else {
             return Ok(None);
         };
-        program.bind_layer(weights, None, owner).map(Some)
+        program
+            .bind_layer(weights, None, layer_output_basis, owner)
+            .map(Some)
     }
 
     /// Permanently disables further ANE program lookups for this session.
@@ -112,6 +166,7 @@ impl Session {
         &self,
         shape: Shape,
         host_factory: impl FnOnce() -> Result<Host, Error>,
+        prepare: impl FnOnce(&Host) -> Result<(), Error>,
     ) -> Result<Option<Arc<Program>>, Error> {
         if self.is_retired() {
             return Ok(None);
@@ -122,10 +177,37 @@ impl Session {
             return Ok(None);
         }
         if let Some((_, program)) = state.programs.iter().find(|(known, _)| *known == shape) {
-            return Ok(program.clone());
+            let Some(program) = program.clone() else {
+                return Ok(None);
+            };
+            let host = state
+                .host
+                .as_ref()
+                .expect("a cached program keeps its host in the session")
+                .clone();
+            prepare(&host)?;
+            return Ok(Some(program));
         }
 
-        match self.build(shape, host_factory, &mut state) {
+        if state.host.is_none() {
+            match host_factory() {
+                Ok(host) => state.host = Some(host),
+                Err(error) => {
+                    state.programs.push((shape, None));
+                    if is_unavailable(&error) {
+                        self.retire();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let host = state
+            .host
+            .as_ref()
+            .expect("the host was initialized above")
+            .clone();
+        prepare(&host)?;
+        match self.build(shape, &host, &mut state) {
             Ok(program) => {
                 let program = Arc::new(program);
                 state.programs.push((shape, Some(program.clone())));
@@ -141,25 +223,30 @@ impl Session {
         }
     }
 
-    fn build(
-        &self,
-        shape: Shape,
-        host_factory: impl FnOnce() -> Result<Host, Error>,
-        state: &mut State,
-    ) -> Result<Program, Error> {
-        if state.host.is_none() {
-            state.host = Some(host_factory()?);
-        }
-        let host = state.host.as_ref().expect("the host was created above");
+    fn build(&self, shape: Shape, host: &Host, state: &mut State) -> Result<Program, Error> {
         match shape {
             Shape::Ffn {
                 hidden,
                 intermediate,
-            } => Program::ffn(hidden, intermediate, host, self.retired.clone()),
+                up_output_basis,
+            } => Program::ffn(
+                hidden,
+                intermediate,
+                up_output_basis,
+                host,
+                self.retired.clone(),
+            ),
             Shape::Linear { output } => {
                 Program::linear(output, &mut state.linear, host, self.retired.clone())
             }
         }
+    }
+}
+
+fn output_basis(layer: &WeightLayer<'_>) -> OutputBasis {
+    match layer.output_rotation {
+        Some(rotation) if rotation.block_size == 32 => OutputBasis::Hadamard32,
+        _ => OutputBasis::Identity,
     }
 }
 

@@ -10,6 +10,7 @@
 
 use super::{
     FFN_SHAPE_ALIGNMENT, INPUT_CHANNELS,
+    kernels::OutputBasis,
     signs::{intermediate_signs, signed_hadamard_blocks},
 };
 use crate::{
@@ -31,9 +32,13 @@ pub const MAX_FFN_HIDDEN: usize = 2 * INPUT_CHANNELS;
 pub const MAX_LINEAR_OUTPUT: usize = 16384;
 pub const MAX_INTERMEDIATE: usize = 5 * INPUT_CHANNELS;
 
-pub fn compile_ffn(hidden: usize, intermediate: usize) -> Result<Vec<Executable>, Error> {
+pub fn compile_ffn(
+    hidden: usize,
+    intermediate: usize,
+    up_output_basis: OutputBasis,
+) -> Result<Vec<Executable>, Error> {
     let graph = Graph::new();
-    let constants = Constants::new(&graph, intermediate)?;
+    let constants = Constants::new(&graph, intermediate, up_output_basis)?;
     let outputs = TOKEN_COUNTS
         .iter()
         .map(|rows| ffn_function(&graph, hidden, intermediate, &constants, *rows as usize))
@@ -109,7 +114,7 @@ fn block_rotation(graph: &Graph, input: &Tensor, weights: &Tensor) -> Result<Ten
 
 /// What every function of one program shares: the model stores each constant once.
 struct Constants {
-    up_rotation: Tensor,
+    up_rotation: Option<Tensor>,
     rotation: Tensor,
     one: Tensor,
     floor: Tensor,
@@ -118,14 +123,24 @@ struct Constants {
 }
 
 impl Constants {
-    fn new(graph: &Graph, intermediate: usize) -> Result<Self, GraphError> {
-        let up_rotation = signed_hadamard_blocks(&vec![1.0; intermediate], UP_ROTATION_BLOCK);
+    fn new(
+        graph: &Graph,
+        intermediate: usize,
+        up_output_basis: OutputBasis,
+    ) -> Result<Self, GraphError> {
+        let up_rotation = (up_output_basis == OutputBasis::Hadamard32)
+            .then(|| signed_hadamard_blocks(&vec![1.0; intermediate], UP_ROTATION_BLOCK));
         let rotation = signed_hadamard_blocks(
             &intermediate_signs(intermediate),
             INTERMEDIATE_ROTATION_BLOCK,
         );
+        let up_rotation = if let Some(values) = up_rotation {
+            Some(graph.constant(&values, [intermediate, UP_ROTATION_BLOCK, 1, 1])?)
+        } else {
+            None
+        };
         Ok(Self {
-            up_rotation: graph.constant(&up_rotation, [intermediate, UP_ROTATION_BLOCK, 1, 1])?,
+            up_rotation,
             rotation: graph
                 .constant(&rotation, [intermediate, INTERMEDIATE_ROTATION_BLOCK, 1, 1])?,
             one: graph.constant(&[1.0], [1, 1])?,
@@ -158,8 +173,14 @@ fn ffn_function(
     let x_segments = segments(graph, &x_dequantized)?;
     let gate = graph.multiplication(&project(graph, &wg, intermediate, &x_segments)?, &sg)?;
     let value = graph.multiplication(&project(graph, &wu, intermediate, &x_segments)?, &su)?;
-    let gate = block_rotation(graph, &gate, &constants.up_rotation)?;
-    let value = block_rotation(graph, &value, &constants.up_rotation)?;
+    let (gate, value) = if let Some(rotation) = constants.up_rotation.as_ref() {
+        (
+            block_rotation(graph, &gate, rotation)?,
+            block_rotation(graph, &value, rotation)?,
+        )
+    } else {
+        (gate, value)
+    };
 
     let scaled = graph.multiplication(&gate, &tx)?;
     let half_gate = graph.multiplication(&scaled, &zg)?;

@@ -20,10 +20,10 @@ use super::{
         UP_ROTATION_BLOCK, compile_ffn, compile_linear,
     },
     kernels::{
-        DownRegions, Kernels, Launch, LayerRegions, PackDimensions, Region, Surface, UpStageRows,
-        W4, W4Layout,
+        CompactStageRows, DownRegions, Kernels, Launch, LayerRegions, OutputBasis, PackDimensions,
+        Region, Surface, UpStageRows, W4, W4Layout, WeightLayer, WeightSource,
     },
-    signs::{LayerSigns, RhtW4, intermediate_signs, pack_signs, sign_bits},
+    signs::{LayerSigns, intermediate_signs, pack_signs, sign_bits},
 };
 use crate::{
     BoundExecution, DataType, Error, EventSequence, EventValues, Executable, SharedEvent,
@@ -90,6 +90,100 @@ fn valid_region(region: Region, bytes: usize, alignment: u64) -> bool {
             .ok()
             .and_then(|bytes| region.address.checked_add(bytes))
             .is_some()
+}
+
+fn valid_source(source: WeightSource, rows: usize, columns: usize) -> bool {
+    match source {
+        WeightSource::W4(w4) => valid_w4(w4, rows, columns),
+        WeightSource::SymmetricU8 {
+            codes,
+            scales,
+            scale_stride,
+            group_size,
+            layout,
+            signed_codes,
+        } => {
+            if group_size == 0
+                || !group_size.is_multiple_of(16)
+                || !columns.is_multiple_of(group_size as usize)
+            {
+                return false;
+            }
+            if (layout == super::kernels::WeightCodeLayout::MxuTiled
+                && (rows % 32 != 0 || columns % 32 != 0 || !signed_codes))
+                || (layout == super::kernels::WeightCodeLayout::RowMajor
+                    && !columns.is_multiple_of(16))
+            {
+                return false;
+            }
+            let groups = columns / group_size as usize;
+            let Some(code_bytes) = rows.checked_mul(columns) else {
+                return false;
+            };
+            let Some(scale_bytes) = groups
+                .checked_mul(scale_stride as usize)
+                .and_then(|n| n.checked_mul(2))
+            else {
+                return false;
+            };
+            scale_stride as usize >= rows
+                && valid_region(codes, code_bytes, 4)
+                && valid_region(scales, scale_bytes, 2)
+        }
+        WeightSource::MlxU2ScaleBias {
+            codes,
+            scales,
+            biases,
+            scale_stride,
+            group_size,
+            layout,
+            signed_codes,
+        } => {
+            if group_size == 0
+                || !group_size.is_multiple_of(16)
+                || !columns.is_multiple_of(group_size as usize)
+                || !columns.is_multiple_of(16)
+            {
+                return false;
+            }
+            if signed_codes
+                || (layout == super::kernels::WeightCodeLayout::MxuTiled
+                    && (rows % 16 != 0 || columns % 128 != 0))
+            {
+                return false;
+            }
+            let groups = columns / group_size as usize;
+            let Some(code_bytes) = rows.checked_mul(columns / 4) else {
+                return false;
+            };
+            let Some(parameter_bytes) = groups
+                .checked_mul(scale_stride as usize)
+                .and_then(|n| n.checked_mul(2))
+            else {
+                return false;
+            };
+            scale_stride as usize >= rows
+                && valid_region(codes, code_bytes, 4)
+                && valid_region(scales, parameter_bytes, 2)
+                && valid_region(biases, parameter_bytes, 2)
+        }
+    }
+}
+
+fn valid_weight_layer(layer: &WeightLayer<'_>) -> bool {
+    let (rows, columns) = (layer.rows as usize, layer.columns as usize);
+    let input = layer.input_rotation;
+    let output = layer.output_rotation;
+    let w4_basis = !matches!(layer.source, WeightSource::W4(_))
+        || (input.block_size == 32 && output.is_some_and(|rotation| rotation.block_size == 32));
+    rows > 0
+        && columns > 0
+        && w4_basis
+        && matches!(input.block_size, 32 | 128)
+        && columns.is_multiple_of(input.block_size as usize)
+        && input.signs.len() == columns
+        && output.is_none_or(|rotation| rotation.block_size == 32 && rotation.signs.len() == rows)
+        && valid_source(layer.source, rows, columns)
 }
 
 /// The Metal device, kernels, and residency policy shared by programs.
@@ -285,6 +379,7 @@ struct Program {
     channels: u32,
     _signs: Buffer,
     pack_signs: Region,
+    intermediate_signs: Region,
     intermediate_bits: Region,
     lanes: [Lane; 2],
     /// Counts the calls started: they alternate between the lanes.
@@ -302,11 +397,12 @@ impl Program {
     fn ffn(
         hidden: usize,
         intermediate: usize,
+        up_output_basis: OutputBasis,
         host: &Host,
         retired: Arc<AtomicBool>,
     ) -> Result<Self, Error> {
         assert!(fits_ffn(hidden, intermediate));
-        let executables = compile_ffn(hidden, intermediate)?;
+        let executables = compile_ffn(hidden, intermediate, up_output_basis)?;
         let surfaces = [
             Surfaces::ffn(host, hidden, intermediate)?,
             Surfaces::ffn(host, hidden, intermediate)?,
@@ -370,6 +466,7 @@ impl Program {
         ];
         let mut bytes = Vec::new();
         let pack = append(&mut bytes, &pack_signs(widths.input));
+        let intermediate = append(&mut bytes, intermediate_signs);
         let bits = append(&mut bytes, &sign_bits(intermediate_signs));
         let signs = host.upload(&bytes)?;
         let base = signs.region();
@@ -379,6 +476,7 @@ impl Program {
             input_width: widths.input as u32,
             channels: widths.channels as u32,
             pack_signs: slice(base, pack),
+            intermediate_signs: slice(base, intermediate),
             intermediate_bits: slice(base, bits),
             _signs: signs,
             lanes,
@@ -389,8 +487,9 @@ impl Program {
 
     fn bind_layer(
         self: &Arc<Self>,
-        up: &RhtW4,
-        down: Option<&RhtW4>,
+        up: &WeightLayer<'_>,
+        down: Option<&WeightLayer<'_>>,
+        output_basis: OutputBasis,
         owner: Arc<dyn Send + Sync>,
     ) -> Result<Layer, Error> {
         assert_eq!(down.is_some(), self.lanes[0].surfaces.down.is_some());
@@ -401,12 +500,16 @@ impl Program {
         let output = append(&mut bytes, &signs.output);
         let gate = append(&mut bytes, &signs.gate);
         let bits = append(&mut bytes, &signs.pre_bits);
+        let down_pre = append(&mut bytes, &signs.down_pre);
         let signs = self.host.upload(&bytes)?;
         let base = signs.region();
         let mut down_regions = None;
         if let Some(down) = down {
             down_regions = Some(DownRegions {
-                w4: down.w4,
+                source: down.source,
+                input_block: down.input_rotation.block_size,
+                pre_signs: slice(base, down_pre),
+                post_signs: self.intermediate_signs,
                 gate_signs: slice(base, gate),
                 pre_bits: slice(base, bits),
                 intermediate_bits: self.intermediate_bits,
@@ -416,9 +519,11 @@ impl Program {
             program: self.clone(),
             _owner: owner,
             regions: LayerRegions {
-                up: up.w4,
+                up: up.source,
                 pre_signs: slice(base, pre),
                 output_signs: slice(base, output),
+                output_basis,
+                input_block: up.input_rotation.block_size,
                 channels: self.channels,
                 width: self.width,
                 down: down_regions,
@@ -435,33 +540,90 @@ impl Program {
     ) -> Result<(), ExecutionError<Q::Error>> {
         let kernels = &self.host.kernels;
         for (index, rows) in surfaces.up.iter().enumerate() {
-            let launch = kernels.stage_up(
-                layer.up,
-                layer.pre_signs,
-                &rows.weights,
-                &rows.scales,
-                UpStageRows {
-                    width: self.input_width,
-                    first_row: index as u32 * layer.channels,
-                    rows: layer.channels,
-                },
-            );
-            // SAFETY: the layer and lane keep the regions live through this encoding.
-            unsafe { queue.execute(Step::Dispatch(launch)) }.map_err(ExecutionError::Queue)?;
+            let source_row_offset = index as u32 * layer.channels;
+            match layer.up {
+                WeightSource::W4(w4) => {
+                    let launch = kernels.stage_up(
+                        w4,
+                        layer.pre_signs,
+                        &rows.weights,
+                        &rows.scales,
+                        UpStageRows {
+                            width: self.input_width,
+                            first_row: source_row_offset,
+                            rows: layer.channels,
+                        },
+                    );
+                    // SAFETY: the layer and lane keep the regions live through this encoding.
+                    unsafe { queue.execute(Step::Dispatch(launch)) }
+                        .map_err(ExecutionError::Queue)?;
+                }
+                source => {
+                    let launch = kernels
+                        .stage_weight(
+                            source,
+                            CompactStageRows {
+                                source_row_offset,
+                                rows: layer.channels,
+                                columns: self.input_width,
+                                source_block: layer.input_block,
+                                pre_signs: layer.pre_signs,
+                                target_block: if self.input_width as usize == INPUT_CHANNELS {
+                                    INPUT_CHANNELS as u32
+                                } else {
+                                    FFN_SHAPE_ALIGNMENT as u32
+                                },
+                                post_signs: None,
+                            },
+                            &rows.weights,
+                            &rows.scales,
+                        )
+                        .map_err(|error| ExecutionError::Program(Error::Metal(error)))?;
+                    // SAFETY: the layer and lane keep all source and destination regions live.
+                    unsafe { queue.execute(Step::Dispatch(launch)) }
+                        .map_err(ExecutionError::Queue)?;
+                }
+            }
         }
         if let (Some(down), Some((gate_signs, rows))) = (&layer.down, &surfaces.down) {
             let signs = kernels.stage_gate_signs(down.gate_signs, gate_signs, layer.channels);
             // SAFETY: the layer and lane keep the regions live through this encoding.
             unsafe { queue.execute(Step::Dispatch(signs)) }.map_err(ExecutionError::Queue)?;
-            let rows = kernels.stage_down(
-                down,
-                &rows.weights,
-                &rows.scales,
-                layer.width,
-                layer.channels,
-            );
-            // SAFETY: the layer and lane keep the regions live through this encoding.
-            unsafe { queue.execute(Step::Dispatch(rows)) }.map_err(ExecutionError::Queue)?;
+            match down.source {
+                WeightSource::W4(_) => {
+                    let rows = kernels.stage_down(
+                        down,
+                        &rows.weights,
+                        &rows.scales,
+                        layer.width,
+                        layer.channels,
+                    );
+                    // SAFETY: the layer and lane keep the regions live through this encoding.
+                    unsafe { queue.execute(Step::Dispatch(rows)) }
+                        .map_err(ExecutionError::Queue)?;
+                }
+                source => {
+                    let launch = kernels
+                        .stage_weight(
+                            source,
+                            CompactStageRows {
+                                source_row_offset: 0,
+                                rows: layer.width,
+                                columns: layer.channels,
+                                source_block: down.input_block,
+                                pre_signs: down.pre_signs,
+                                target_block: FFN_SHAPE_ALIGNMENT as u32,
+                                post_signs: Some(down.post_signs),
+                            },
+                            &rows.weights,
+                            &rows.scales,
+                        )
+                        .map_err(|error| ExecutionError::Program(Error::Metal(error)))?;
+                    // SAFETY: the layer and lane keep all source and destination regions live.
+                    unsafe { queue.execute(Step::Dispatch(launch)) }
+                        .map_err(ExecutionError::Queue)?;
+                }
+            }
         }
         Ok(())
     }
@@ -478,7 +640,7 @@ pub struct Layer {
 /// What the host does on its queue, in order.
 pub enum Step<'a> {
     /// Encodes a compute dispatch.
-    Dispatch(Launch<'a>),
+    Dispatch(Launch),
     /// Makes the queue signal the event to the value once the steps before it are done.
     Signal(&'a Event, u64),
     /// Makes the queue wait for the event to reach the value before the steps after it.

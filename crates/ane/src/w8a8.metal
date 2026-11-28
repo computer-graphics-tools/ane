@@ -367,6 +367,46 @@ struct UnpackArguments {
   }
 }
 
+// Identity output basis for formats whose projections have no output Hadamard
+// transform.
+[[kernel, max_total_threads_per_threadgroup(THREADS)]] void unpack_activations_identity(
+    const device half* surface [[buffer(0)]],
+    const device half* token_scales [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant UnpackArguments& arguments [[buffer(3)]],
+    uint3 tile_index [[threadgroup_position_in_grid]],
+    uint3 thread_index [[thread_position_in_threadgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]]
+) {
+  threadgroup float tile[TILE * (TILE + 1)];
+  const uint thread_id = thread_index.x;
+  const uint channel_base = tile_index.x * TILE;
+  const uint token_base = tile_index.y * TILE;
+  for (uint index = thread_id; index < TILE * TILE; index += THREADS) {
+    const uint channel = index / TILE;
+    const uint token = index % TILE;
+    float value = 0.0f;
+    if (token_base + token < arguments.tokens) {
+      value = float(surface[ulong(channel_base + channel) * arguments.row_stride + token_base + token]);
+    }
+    tile[channel * (TILE + 1) + token] = value;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (uint token = simdgroup; token < TILE; token += THREADS / 32) {
+    const uint global_token = token_base + token;
+    if (global_token >= arguments.tokens) {
+      break;
+    }
+    float scale = float(token_scales[global_token]);
+    if (arguments.scale_row) {
+      scale *= float(surface[ulong(arguments.channels) * arguments.row_stride + global_token]);
+    }
+    output[ulong(global_token) * arguments.channels + channel_base + thread_index.x % 32] =
+        bfloat(tile[(thread_index.x % 32) * (TILE + 1) + token] * scale);
+  }
+}
+
 // The FFN's `zg` surface: the gate's output signs times 1/2 (the `g/2` of SiLU), one per row of a [rows, 1]
 // fp16 surface.
 struct GateSignsArguments {
